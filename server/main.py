@@ -172,6 +172,11 @@ def search_products(query: str) -> list[dict]:
         return []
 
 
+@app.on_event("startup")
+async def startup():
+    get_model()
+
+
 @app.post("/api/encode")
 async def encode_image(file: UploadFile = File(...)):
     proc, mdl = get_model()
