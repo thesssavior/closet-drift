@@ -35,6 +35,7 @@ export default function Home() {
   const [selectedCategory, setSelectedCategory] = useState("");
   const [dragging, setDragging] = useState(false);
 
+  const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const shimmerRef = useRef<HTMLCanvasElement>(null);
@@ -52,9 +53,10 @@ export default function Home() {
     const overlay = overlayRef.current!;
     const ctx = canvas.getContext("2d")!;
 
-    const maxW = Math.min(canvas.parentElement!.clientWidth - 48, 720);
-    const maxH = window.innerHeight * 0.68;
-    const scale = Math.min(maxW / img.naturalWidth, maxH / img.naturalHeight, 1);
+    const container = containerRef.current ?? canvas.parentElement!;
+    const maxW = Math.min(container.clientWidth - 48, 860);
+    const maxH = Math.min(container.clientHeight - 80, 640);
+    const scale = Math.min(maxW / img.naturalWidth, maxH / img.naturalHeight);
     const w = Math.floor(img.naturalWidth * scale);
     const h = Math.floor(img.naturalHeight * scale);
 
@@ -347,7 +349,7 @@ export default function Home() {
       {/* Main content */}
       <div className="relative z-10 flex flex-col lg:flex-row h-[calc(100vh-57px)]">
         {/* Left: Image */}
-        <div className="flex-1 flex flex-col items-center justify-center p-6 overflow-auto">
+        <div ref={containerRef} className="flex-1 flex flex-col items-center justify-center p-6 overflow-auto">
           {!imageSrc ? (
             <div className="flex flex-col items-center gap-10 w-full max-w-md animate-fade-in">
               <div className="text-center space-y-3">
