@@ -33,6 +33,7 @@ export default function Home() {
   const [searching, setSearching] = useState(false);
   const [hoveredCategory, setHoveredCategory] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
+  const [dragging, setDragging] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
@@ -359,16 +360,17 @@ export default function Home() {
               </div>
 
               <label
-                className="group relative flex flex-col items-center justify-center w-full h-72 border border-white/[0.06] rounded-2xl cursor-pointer hover:border-white/[0.12] bg-white/[0.02] hover:bg-white/[0.04] transition-all duration-500"
-                onDragOver={(e) => e.preventDefault()}
-                onDrop={handleDrop}
+                className={`group relative flex flex-col items-center justify-center w-full h-72 border border-white/[0.06] rounded-2xl cursor-pointer hover:border-white/[0.12] bg-white/[0.02] hover:bg-white/[0.04] transition-all duration-500 ${dragging ? "border-white/[0.12] bg-white/[0.04]" : ""}`}
+                onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+                onDragLeave={() => setDragging(false)}
+                onDrop={(e) => { setDragging(false); handleDrop(e); }}
               >
                 {/* Hover gradient border */}
-                <div className="absolute inset-[-1px] rounded-2xl bg-gradient-to-br from-purple-500/0 via-transparent to-blue-500/0 group-hover:from-purple-500/20 group-hover:to-blue-500/20 transition-all duration-700 pointer-events-none" />
+                <div className={`absolute inset-[-1px] rounded-2xl bg-gradient-to-br from-purple-500/0 via-transparent to-blue-500/0 group-hover:from-purple-500/20 group-hover:to-blue-500/20 transition-all duration-700 pointer-events-none ${dragging ? "from-purple-500/20 to-blue-500/20" : ""}`} />
 
                 <div className="relative flex flex-col items-center gap-5">
-                  <div className="w-14 h-14 rounded-xl bg-white/[0.04] group-hover:bg-white/[0.08] border border-white/[0.06] flex items-center justify-center transition-all duration-300 group-hover:scale-105">
-                    <svg className="w-6 h-6 text-zinc-500 group-hover:text-zinc-300 transition-colors duration-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <div className={`w-14 h-14 rounded-xl bg-white/[0.04] group-hover:bg-white/[0.08] border border-white/[0.06] flex items-center justify-center transition-all duration-300 group-hover:scale-105 ${dragging ? "bg-white/[0.08] scale-105" : ""}`}>
+                    <svg className={`w-6 h-6 text-zinc-500 group-hover:text-zinc-300 transition-colors duration-300 ${dragging ? "text-zinc-300" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                       <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
                     </svg>
                   </div>
