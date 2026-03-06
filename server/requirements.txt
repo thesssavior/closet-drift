@@ -1,9 +1,10 @@
 fastapi
 python-multipart
 uvicorn[standard]
-torch --index-url https://download.pytorch.org/whl/cpu
+optimum[onnxruntime]
 transformers
 numpy
+scipy
 Pillow
 requests
 python-dotenv

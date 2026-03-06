@@ -11,10 +11,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 
-# Pre-download the model at build time so it's baked into the image
-RUN python -c "from transformers import SegformerImageProcessor, AutoModelForSemanticSegmentation; \
+# Pre-download and export ONNX model at build time
+RUN python -c "from transformers import SegformerImageProcessor; \
+    from optimum.onnxruntime import ORTModelForSemanticSegmentation; \
     SegformerImageProcessor.from_pretrained('mattmdjaga/segformer_b2_clothes'); \
-    AutoModelForSemanticSegmentation.from_pretrained('mattmdjaga/segformer_b2_clothes')"
+    ORTModelForSemanticSegmentation.from_pretrained('mattmdjaga/segformer_b2_clothes', export=True)"
 
 EXPOSE 8000
 

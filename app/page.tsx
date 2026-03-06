@@ -34,6 +34,7 @@ export default function Home() {
   const [hoveredCategory, setHoveredCategory] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
   const [dragging, setDragging] = useState(false);
+  const [progress, setProgress] = useState(0);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -101,12 +102,24 @@ export default function Home() {
         try {
           setStage("encoding");
           setStatusText("Analyzing outfit...");
+          setProgress(0);
+
+          // Simulated progress that slows as it approaches 90%
+          let p = 0;
+          const interval = setInterval(() => {
+            p += (90 - p) * 0.08;
+            setProgress(Math.round(p));
+          }, 200);
+
           const result = await encodeImage(file);
+          clearInterval(interval);
+          setProgress(100);
           hashRef.current = result.hash;
           setStage("ready");
           setStatusText("Hover to detect — click to search");
         } catch (err: any) {
           setStage("idle");
+          setProgress(0);
           setStatusText(`Error: ${err.message}. Is the server running?`);
         }
       };
@@ -396,12 +409,17 @@ export default function Home() {
             <div className="flex flex-col items-center gap-5 w-full animate-fade-in-scale">
               {/* Status */}
               {stage === "encoding" && (
-                <div className="flex items-center gap-3 bg-white/[0.03] border border-white/[0.06] rounded-xl px-5 py-3 backdrop-blur-sm">
-                  <div className="relative w-4 h-4">
-                    <div className="absolute inset-0 rounded-full border-2 border-white/10" />
-                    <div className="absolute inset-0 rounded-full border-2 border-t-purple-400 animate-spin" />
+                <div className="flex flex-col items-center gap-2 bg-white/[0.03] border border-white/[0.06] rounded-xl px-5 py-3 backdrop-blur-sm min-w-[260px]">
+                  <div className="flex items-center justify-between w-full">
+                    <span className="text-sm text-zinc-400">{statusText}</span>
+                    <span className="text-xs text-zinc-500 tabular-nums">{progress}%</span>
                   </div>
-                  <span className="text-sm text-zinc-400">{statusText}</span>
+                  <div className="w-full h-1 bg-white/[0.06] rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-gradient-to-r from-purple-500 to-blue-500 rounded-full transition-all duration-200 ease-out"
+                      style={{ width: `${progress}%` }}
+                    />
+                  </div>
                 </div>
               )}
 

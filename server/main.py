@@ -14,9 +14,9 @@ load_dotenv(_project_root / ".env")
 
 import numpy as np
 import requests as http_requests
-import torch
-import torch.nn as nn
-from transformers import SegformerImageProcessor, AutoModelForSemanticSegmentation
+from transformers import SegformerImageProcessor
+from optimum.onnxruntime import ORTModelForSemanticSegmentation
+from scipy.ndimage import zoom
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -80,15 +80,15 @@ seg_cache: dict[str, dict] = {}
 def get_model():
     global processor, model
     if processor is None:
-        print("Loading SegFormer model...")
+        print("Loading SegFormer ONNX model...")
         processor = SegformerImageProcessor.from_pretrained(
             "mattmdjaga/segformer_b2_clothes"
         )
-        model = AutoModelForSemanticSegmentation.from_pretrained(
-            "mattmdjaga/segformer_b2_clothes"
+        model = ORTModelForSemanticSegmentation.from_pretrained(
+            "mattmdjaga/segformer_b2_clothes",
+            export=True,
         )
-        model.eval()
-        print("Model loaded.")
+        print("ONNX model loaded.")
     return processor, model
 
 
@@ -185,18 +185,18 @@ async def encode_image(file: UploadFile = File(...)):
     h = image_hash(data)
 
     if h not in seg_cache:
-        inputs = proc(images=img, return_tensors="pt")
-        with torch.no_grad():
-            outputs = mdl(**inputs)
+        inputs = proc(images=img, return_tensors="np")
+        outputs = mdl(**{k: v for k, v in inputs.items()})
 
-        logits = outputs.logits
-        upsampled = nn.functional.interpolate(
-            logits,
-            size=img.size[::-1],
-            mode="bilinear",
-            align_corners=False,
-        )
-        seg_map = upsampled.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
+        logits = outputs.logits  # (1, num_classes, H, W)
+        if hasattr(logits, "numpy"):
+            logits = logits.numpy()
+        logits = np.array(logits)
+        target_h, target_w = img.size[1], img.size[0]
+        _, _, lh, lw = logits.shape
+        zoom_factors = (1, 1, target_h / lh, target_w / lw)
+        upsampled = zoom(logits, zoom_factors, order=1)
+        seg_map = upsampled.argmax(axis=1)[0].astype(np.uint8)
 
         seg_cache[h] = {
             "seg_map": seg_map,
