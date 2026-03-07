@@ -36,6 +36,9 @@ GEMINI_EMBED_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gem
 qdrant: QdrantClient | None = None
 QDRANT_COLLECTION = "fashionpedia"
 
+# Map S3 filenames -> Flickr original URLs (S3 bucket is access-restricted)
+_flickr_url_map: dict[str, str] = {}
+
 LABELS = {
     0: "Background",
     1: "Hat",
@@ -143,6 +146,14 @@ def dominant_color_name(img: Image.Image, mask: np.ndarray) -> str:
     return "pink"
 
 
+def _resolve_image_url(url: str) -> str:
+    """Convert S3 URL to Flickr original URL."""
+    if not url or not _flickr_url_map:
+        return url
+    filename = url.split("/")[-1]
+    return _flickr_url_map.get(filename, url)
+
+
 def embed_query(text: str) -> list[float]:
     """Embed a single query using Gemini."""
     resp = http_requests.post(
@@ -154,7 +165,7 @@ def embed_query(text: str) -> list[float]:
     return resp.json()["embedding"]["values"]
 
 
-def search_qdrant(query: str, limit: int = 8) -> list[dict]:
+def search_qdrant(query: str, limit: int = 16) -> list[dict]:
     """Vector search on Qdrant using Gemini embeddings."""
     if not qdrant or not GEMINI_API_KEY:
         return []
@@ -173,7 +184,7 @@ def search_qdrant(query: str, limit: int = 8) -> list[dict]:
                 "id": point.id,
                 "name": p.get("description", ""),
                 "price": "",
-                "image": p.get("image_url", ""),
+                "image": _resolve_image_url(p.get("image_url", "")),
                 "brand": ", ".join(p.get("attributes", [])[:3]),
                 "link": "",
             })
@@ -195,6 +206,16 @@ async def startup():
         print(f"Connected to Qdrant at {qdrant_url}")
     else:
         print("WARNING: QDRANT_URL / QDRANT_API_KEY not set, search disabled")
+
+    # Load Flickr URL map
+    import json
+    ann_path = Path(__file__).parent / "data" / "fashionpedia_train.json"
+    if ann_path.exists():
+        with open(ann_path) as f:
+            ann = json.load(f)
+        for img in ann["images"]:
+            _flickr_url_map[img["file_name"]] = img.get("original_url", "")
+        print(f"Loaded {len(_flickr_url_map)} Flickr URL mappings")
 
 
 @app.post("/api/encode")
@@ -317,6 +338,30 @@ async def search_item(body: dict):
         "query": query,
         "products": products,
     }
+
+
+@app.post("/api/clothing-mask")
+async def clothing_mask(body: dict):
+    """Return combined mask of all clothing segments."""
+    h = body["hash"]
+    canvas_w = int(body["canvasWidth"])
+    canvas_h = int(body["canvasHeight"])
+
+    if h not in seg_cache:
+        return JSONResponse({"error": "Image not encoded"}, 400)
+
+    seg_map = seg_cache[h]["seg_map"]
+    combined = np.zeros_like(seg_map, dtype=np.uint8)
+    for cid in CLOTHING_IDS:
+        combined[seg_map == cid] = 255
+
+    mask_img = Image.fromarray(combined)
+    mask_img = mask_img.resize((canvas_w, canvas_h), Image.BILINEAR)
+    mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=2))
+
+    buf = io.BytesIO()
+    mask_img.save(buf, format="PNG")
+    return {"mask": base64.b64encode(buf.getvalue()).decode()}
 
 
 @app.get("/api/health")

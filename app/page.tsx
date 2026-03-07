@@ -5,6 +5,7 @@ import {
   encodeImage,
   decodeMask,
   searchProducts,
+  fetchClothingMask,
   type Product,
 } from "./lib/sam2";
 
@@ -45,6 +46,7 @@ export default function Home() {
   const [progress, setProgress] = useState(0);
   const [focusBox, setFocusBox] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [focusDimmed, setFocusDimmed] = useState(false);
+  const [failedImages, setFailedImages] = useState<Set<string>>(new Set());
 
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -62,6 +64,10 @@ export default function Home() {
   const clearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const focusDimmedRef = useRef(false);
   const clickGenRef = useRef(0);
+  const dripRef = useRef<HTMLCanvasElement>(null);
+  const dripMaskCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const dripRafRef = useRef<number>(0);
+  const startDripRef = useRef<((maskB64: string) => void) | null>(null);
 
   const drawImage = useCallback((img: HTMLImageElement) => {
     const canvas = canvasRef.current!;
@@ -76,7 +82,7 @@ export default function Home() {
 
     canvas.width = w;
     canvas.height = h;
-    for (const ref of [overlayARef, overlayBRef]) {
+    for (const ref of [overlayARef, overlayBRef, dripRef]) {
       if (ref.current) { ref.current.width = w; ref.current.height = h; }
     }
     ctx.drawImage(img, 0, 0, w, h);
@@ -99,7 +105,7 @@ export default function Home() {
     async (file: File) => {
       const url = URL.createObjectURL(file);
       setImageSrc(url);
-      setProducts([]);
+      setProducts([]); setFailedImages(new Set());
       setSearchQuery("");
       setSelectedCategory("");
       setFocusBox(null);
@@ -129,6 +135,14 @@ export default function Home() {
           hashRef.current = result.hash;
           setStage("ready");
           setStatusText("Hover to detect — click to search");
+
+          // Start drip animation on clothing segments
+          const canvas = canvasRef.current;
+          if (canvas) {
+            fetchClothingMask(result.hash, canvas.width, canvas.height)
+              .then((r) => { if (r.mask) startDripRef.current?.(r.mask); })
+              .catch(() => {});
+          }
         } catch (err: any) {
           setStage("idle");
           setProgress(0);
@@ -227,6 +241,118 @@ export default function Home() {
     }, 320);
   }, []);
 
+  const startDrip = useCallback((maskB64: string) => {
+    const drip = dripRef.current;
+    if (!drip) return;
+
+    const maskImg = new window.Image();
+    maskImg.onload = () => {
+      const w = drip.width;
+      const h = drip.height;
+
+      // Build clothing mask canvas (R channel → alpha)
+      const maskCanvas = document.createElement("canvas");
+      maskCanvas.width = w;
+      maskCanvas.height = h;
+      const maskCtx = maskCanvas.getContext("2d")!;
+      maskCtx.drawImage(maskImg, 0, 0, w, h);
+      const raw = maskCtx.getImageData(0, 0, w, h);
+      for (let i = 0; i < raw.data.length; i += 4) {
+        const v = raw.data[i];
+        raw.data[i] = 255;
+        raw.data[i + 1] = 255;
+        raw.data[i + 2] = 255;
+        raw.data[i + 3] = v > 20 ? v : 0;
+      }
+      maskCtx.putImageData(raw, 0, 0);
+      dripMaskCanvasRef.current = maskCanvas;
+
+      // Pre-render static rainbow gradient (purple/blue top-left → yellow/red bottom-right)
+      const gradCanvas = document.createElement("canvas");
+      gradCanvas.width = w;
+      gradCanvas.height = h;
+      const gradCtx = gradCanvas.getContext("2d")!;
+      const baseGrad = gradCtx.createLinearGradient(0, 0, w, h);
+      baseGrad.addColorStop(0, "rgba(120, 60, 255, 0.35)");
+      baseGrad.addColorStop(0.2, "rgba(80, 120, 255, 0.32)");
+      baseGrad.addColorStop(0.4, "rgba(60, 200, 220, 0.28)");
+      baseGrad.addColorStop(0.6, "rgba(80, 220, 120, 0.26)");
+      baseGrad.addColorStop(0.8, "rgba(255, 200, 60, 0.28)");
+      baseGrad.addColorStop(1, "rgba(255, 80, 80, 0.35)");
+      gradCtx.fillStyle = baseGrad;
+      gradCtx.fillRect(0, 0, w, h);
+      // Clip gradient to clothing mask
+      gradCtx.globalCompositeOperation = "destination-in";
+      gradCtx.drawImage(maskCanvas, 0, 0);
+      gradCtx.globalCompositeOperation = "source-over";
+
+      drip.style.opacity = "1";
+      const ctx = drip.getContext("2d")!;
+      const radius = Math.max(w, h) * 0.9;
+      let start: number | null = null;
+      const duration = 6000;
+
+      // Pre-render the soft blob onto an offscreen canvas to avoid radial gradient artifacts
+      const blobCanvas = document.createElement("canvas");
+      blobCanvas.width = w;
+      blobCanvas.height = h;
+
+      const animate = (ts: number) => {
+        if (!start) start = ts;
+        const raw = ((ts - start) % duration) / duration;
+        const t = raw < 0.5
+          ? 2 * raw * raw
+          : 1 - 2 * (1 - raw) * (1 - raw);
+        const cx = -radius * 0.2 + (w + radius * 0.4) * t;
+        const cy = -radius * 0.2 + (h + radius * 0.4) * t;
+        // Smooth fade at cycle boundaries
+        const edgeFade = Math.min(raw / 0.2, 1) * Math.min((1 - raw) / 0.2, 1);
+        const smoothFade = edgeFade * edgeFade * (3 - 2 * edgeFade); // smoothstep
+
+        // Draw blob to offscreen
+        const bCtx = blobCanvas.getContext("2d")!;
+        bCtx.clearRect(0, 0, w, h);
+        const fog = bCtx.createRadialGradient(cx, cy, 0, cx, cy, radius);
+        fog.addColorStop(0, "rgba(255,255,255,1)");
+        fog.addColorStop(0.3, "rgba(255,255,255,0.8)");
+        fog.addColorStop(0.6, "rgba(255,255,255,0.3)");
+        fog.addColorStop(0.85, "rgba(255,255,255,0.05)");
+        fog.addColorStop(1, "rgba(255,255,255,0)");
+        bCtx.fillStyle = fog;
+        bCtx.fillRect(0, 0, w, h);
+
+        ctx.clearRect(0, 0, w, h);
+        ctx.globalAlpha = smoothFade;
+        ctx.drawImage(gradCanvas, 0, 0);
+
+        ctx.globalCompositeOperation = "destination-in";
+        ctx.drawImage(blobCanvas, 0, 0);
+        ctx.globalCompositeOperation = "source-over";
+        ctx.globalAlpha = 1;
+
+        dripRafRef.current = requestAnimationFrame(animate);
+      };
+      dripRafRef.current = requestAnimationFrame(animate);
+    };
+    maskImg.src = `data:image/png;base64,${maskB64}`;
+  }, []);
+  startDripRef.current = startDrip;
+
+  const stopDrip = useCallback(() => {
+    if (dripRafRef.current) {
+      cancelAnimationFrame(dripRafRef.current);
+      dripRafRef.current = 0;
+    }
+    const drip = dripRef.current;
+    if (drip) {
+      drip.style.opacity = "0";
+      setTimeout(() => {
+        const ctx = drip.getContext("2d");
+        if (ctx) ctx.clearRect(0, 0, drip.width, drip.height);
+      }, 300);
+    }
+  }, []);
+
   const dismissFocus = useCallback(() => {
     const canvas = canvasRef.current;
     if (canvas) {
@@ -235,7 +361,13 @@ export default function Home() {
     setFocusDimmed(false);
     focusDimmedRef.current = false;
     setTimeout(() => setFocusBox(null), 400);
-  }, []);
+    // Restart drip
+    if (hashRef.current && canvas) {
+      fetchClothingMask(hashRef.current, canvas.width, canvas.height)
+        .then((r) => { if (r.mask) startDrip(r.mask); })
+        .catch(() => {});
+    }
+  }, [startDrip]);
 
   const handleMouseLeave = useCallback(() => {
     clearOverlay();
@@ -341,7 +473,7 @@ export default function Home() {
             canvasY >= focusBox.y && canvasY <= focusBox.y + focusBox.h) {
           dismissFocus();
           clearOverlay();
-          setProducts([]);
+          setProducts([]); setFailedImages(new Set());
           setSearchQuery("");
           setSelectedCategory("");
           lastCategoryRef.current = -1;
@@ -354,9 +486,10 @@ export default function Home() {
 
       const gen = ++clickGenRef.current;
 
+      stopDrip();
       clearOverlay();
       setSearching(true);
-      setProducts([]);
+      setProducts([]); setFailedImages(new Set());
       setSearchQuery("");
 
       decodeMask(hash, x, y, canvas.width, canvas.height).then((result) => {
@@ -390,7 +523,7 @@ export default function Home() {
         if (clickGenRef.current === gen) setSearching(false);
       });
     },
-    [stage, canvasToModelCoords, clearOverlay, animateFocusBox, decodeMaskToBbox, focusBox, dismissFocus]
+    [stage, canvasToModelCoords, clearOverlay, animateFocusBox, decodeMaskToBbox, focusBox, dismissFocus, stopDrip]
   );
 
   const handleDrop = useCallback(
@@ -403,10 +536,11 @@ export default function Home() {
   );
 
   const reset = () => {
+    stopDrip();
     setImageSrc(null);
     setStage("idle");
     setStatusText("");
-    setProducts([]);
+    setProducts([]); setFailedImages(new Set());
     setSearchQuery("");
     setSelectedCategory("");
     setFocusBox(null);
@@ -416,7 +550,7 @@ export default function Home() {
   };
 
   const closePanel = useCallback(() => {
-    setProducts([]);
+    setProducts([]); setFailedImages(new Set());
     setSearchQuery("");
     setSelectedCategory("");
     dismissFocus();
@@ -532,6 +666,7 @@ export default function Home() {
               {/* Canvas stack */}
               <div className="relative inline-block rounded-2xl overflow-hidden shadow-2xl shadow-black/50 ring-1 ring-white/[0.06]">
                 <canvas ref={canvasRef} className="block" />
+                <canvas ref={dripRef} className="absolute inset-0 w-full h-full pointer-events-none transition-opacity duration-300 ease-out" style={{ zIndex: 1, opacity: 0 }} />
                 <canvas ref={overlayARef} className="absolute inset-0 w-full h-full pointer-events-none transition-opacity duration-300 ease-out" style={{ zIndex: 11 }} />
                 <canvas ref={overlayBRef} className="absolute inset-0 w-full h-full pointer-events-none transition-opacity duration-300 ease-out" style={{ zIndex: 11 }} />
                 {/* Focus box overlay */}
@@ -626,18 +761,15 @@ export default function Home() {
               {!searching && products.length === 0 && searchQuery && (
                 <div className="text-center py-16">
                   <p className="text-sm text-zinc-600">No products found</p>
-                  <p className="text-xs text-zinc-700 mt-1">Check your SERPER_API_KEY</p>
+                  <p className="text-xs text-zinc-700 mt-1">Try a different garment</p>
                 </div>
               )}
 
               {/* Product grid */}
               <div className="grid grid-cols-2 gap-2.5 stagger-children">
-                {products.map((product, i) => (
-                  <a
+                {products.filter((p) => !failedImages.has(p.image)).map((product, i) => (
+                  <div
                     key={`${product.id}-${i}`}
-                    href={product.link || "#"}
-                    target="_blank"
-                    rel="noopener noreferrer"
                     className="group rounded-xl overflow-hidden border border-white/[0.04] hover:border-white/[0.1] bg-white/[0.02] hover:bg-white/[0.05] transition-all duration-200"
                   >
                     <div className="aspect-square bg-zinc-900 overflow-hidden">
@@ -648,6 +780,7 @@ export default function Home() {
                           alt={product.name}
                           className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500 ease-out"
                           loading="lazy"
+                          onError={() => { setFailedImages((prev) => new Set(prev).add(product.image)); }}
                         />
                       )}
                     </div>
@@ -658,7 +791,7 @@ export default function Home() {
                         <p className="text-[13px] font-semibold text-white">{product.price}</p>
                       )}
                     </div>
-                  </a>
+                  </div>
                 ))}
               </div>
             </div>

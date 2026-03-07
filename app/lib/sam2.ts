@@ -54,6 +54,20 @@ export async function decodeMask(
   return res.json();
 }
 
+export async function fetchClothingMask(
+  hash: string,
+  canvasWidth: number,
+  canvasHeight: number
+): Promise<{ mask: string }> {
+  const res = await fetch(`${API_BASE}/api/clothing-mask`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ hash, canvasWidth, canvasHeight }),
+  });
+  if (!res.ok) throw new Error(`Clothing mask failed: ${res.statusText}`);
+  return res.json();
+}
+
 export async function searchProducts(
   hash: string,
   categoryId: number
