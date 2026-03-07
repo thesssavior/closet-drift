@@ -10,19 +10,28 @@ import {
 
 type Stage = "idle" | "encoding" | "ready";
 
-const CATEGORY_COLORS: Record<number, [number, number, number]> = {
-  1: [45, 90, 65],
-  3: [200, 85, 60],
-  4: [280, 75, 65],
-  5: [330, 80, 65],
-  6: [210, 80, 55],
-  7: [350, 75, 60],
-  8: [30, 70, 50],
-  9: [160, 70, 50],
-  10: [160, 70, 50],
-  16: [140, 65, 55],
-  17: [15, 80, 60],
-};
+function computeBboxFromMask(maskData: ImageData, padding = 16) {
+  const { width, height, data } = maskData;
+  let minX = width, minY = height, maxX = 0, maxY = 0;
+  let found = false;
+  for (let py = 0; py < height; py++) {
+    for (let px = 0; px < width; px++) {
+      if (data[(py * width + px) * 4] > 20) {
+        found = true;
+        minX = Math.min(minX, px);
+        maxX = Math.max(maxX, px);
+        minY = Math.min(minY, py);
+        maxY = Math.max(maxY, py);
+      }
+    }
+  }
+  if (!found) return null;
+  const x = Math.max(0, minX - padding);
+  const y = Math.max(0, minY - padding);
+  const w = Math.min(width - x, maxX - minX + 1 + padding * 2);
+  const h = Math.min(height - y, maxY - minY + 1 + padding * 2);
+  return { x, y, w, h };
+}
 
 export default function Home() {
   const [stage, setStage] = useState<Stage>("idle");
@@ -31,27 +40,31 @@ export default function Home() {
   const [products, setProducts] = useState<Product[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [searching, setSearching] = useState(false);
-  const [hoveredCategory, setHoveredCategory] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
   const [dragging, setDragging] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [focusBox, setFocusBox] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  const [focusDimmed, setFocusDimmed] = useState(false);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const overlayRef = useRef<HTMLCanvasElement>(null);
-  const shimmerRef = useRef<HTMLCanvasElement>(null);
+  const overlayARef = useRef<HTMLCanvasElement>(null);
+  const overlayBRef = useRef<HTMLCanvasElement>(null);
+  const activeOverlayRef = useRef<"A" | "B">("A");
   const imageRef = useRef<HTMLImageElement | null>(null);
   const hashRef = useRef("");
   const fileRef = useRef<File | null>(null);
   const dimsRef = useRef({ scale: 1, origW: 0, origH: 0 });
   const hoverThrottleRef = useRef(0);
   const lastCategoryRef = useRef(-1);
-  const shimmerAnimRef = useRef(0);
+  const lastHoverResultRef = useRef<{ mask: string; category: string; categoryId: number } | null>(null);
   const maskImageDataRef = useRef<ImageData | null>(null);
+  const clearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const focusDimmedRef = useRef(false);
+  const clickGenRef = useRef(0);
 
   const drawImage = useCallback((img: HTMLImageElement) => {
     const canvas = canvasRef.current!;
-    const overlay = overlayRef.current!;
     const ctx = canvas.getContext("2d")!;
 
     const container = containerRef.current ?? canvas.parentElement!;
@@ -63,11 +76,8 @@ export default function Home() {
 
     canvas.width = w;
     canvas.height = h;
-    overlay.width = w;
-    overlay.height = h;
-    if (shimmerRef.current) {
-      shimmerRef.current.width = w;
-      shimmerRef.current.height = h;
+    for (const ref of [overlayARef, overlayBRef]) {
+      if (ref.current) { ref.current.width = w; ref.current.height = h; }
     }
     ctx.drawImage(img, 0, 0, w, h);
     dimsRef.current = { scale, origW: img.naturalWidth, origH: img.naturalHeight };
@@ -92,6 +102,9 @@ export default function Home() {
       setProducts([]);
       setSearchQuery("");
       setSelectedCategory("");
+      setFocusBox(null);
+      setFocusDimmed(false);
+      focusDimmedRef.current = false;
       fileRef.current = file;
       lastCategoryRef.current = -1;
 
@@ -104,7 +117,6 @@ export default function Home() {
           setStatusText("Analyzing outfit...");
           setProgress(0);
 
-          // Simulated progress that slows as it approaches 90%
           let p = 0;
           const interval = setInterval(() => {
             p += (90 - p) * 0.08;
@@ -128,128 +140,105 @@ export default function Home() {
     [drawImage]
   );
 
-  // --- Shimmer animation ---
-  const stopShimmer = useCallback(() => {
-    if (shimmerAnimRef.current) {
-      cancelAnimationFrame(shimmerAnimRef.current);
-      shimmerAnimRef.current = 0;
-    }
-    if (shimmerRef.current) {
-      const ctx = shimmerRef.current.getContext("2d")!;
-      ctx.clearRect(0, 0, shimmerRef.current.width, shimmerRef.current.height);
-    }
-  }, []);
-
-  const startShimmer = useCallback(
-    (maskData: ImageData, hue: number) => {
-      stopShimmer();
-      const shimmer = shimmerRef.current;
-      if (!shimmer) return;
-      const ctx = shimmer.getContext("2d")!;
-      const w = shimmer.width;
-      const h = shimmer.height;
-      const startTime = performance.now();
-
-      const animate = (now: number) => {
-        const elapsed = now - startTime;
-        const t = (elapsed % 2200) / 2200;
-        const pos = -0.3 + t * 1.6;
-
-        ctx.clearRect(0, 0, w, h);
-
-        const cos = Math.cos(Math.PI / 4);
-        const sin = Math.sin(Math.PI / 4);
-        const diag = w * cos + h * sin;
-        const center = pos * diag;
-        const spread = diag * 0.12;
-
-        const grad = ctx.createLinearGradient(-h * sin, 0, w * cos, h * sin + w * cos);
-        const p = center / diag;
-        const cl = (v: number) => Math.max(0, Math.min(1, v));
-
-        grad.addColorStop(cl(p - spread / diag - 0.01), "transparent");
-        grad.addColorStop(cl(p - spread / diag), `hsla(${hue}, 40%, 88%, 0.25)`);
-        grad.addColorStop(cl(p), `hsla(${hue}, 30%, 96%, 0.4)`);
-        grad.addColorStop(cl(p + spread / diag), `hsla(${hue}, 40%, 88%, 0.25)`);
-        grad.addColorStop(cl(p + spread / diag + 0.01), "transparent");
-
-        ctx.fillStyle = grad;
-        ctx.fillRect(0, 0, w, h);
-
-        // Clip to mask
-        const shimmerData = ctx.getImageData(0, 0, w, h);
-        for (let i = 0; i < maskData.data.length; i += 4) {
-          if (maskData.data[i] <= 20) shimmerData.data[i + 3] = 0;
-        }
-        ctx.putImageData(shimmerData, 0, 0);
-
-        shimmerAnimRef.current = requestAnimationFrame(animate);
-      };
-      shimmerAnimRef.current = requestAnimationFrame(animate);
-    },
-    [stopShimmer]
-  );
 
   // --- Mask rendering ---
-  const renderMask = useCallback(
-    (maskB64: string, categoryId: number, mode: "hover" | "selected") => {
-      const overlay = overlayRef.current!;
-      const ctx = overlay.getContext("2d")!;
-      ctx.clearRect(0, 0, overlay.width, overlay.height);
+  const getOverlayRefs = useCallback(() => {
+    const active = activeOverlayRef.current === "A" ? overlayARef : overlayBRef;
+    const inactive = activeOverlayRef.current === "A" ? overlayBRef : overlayARef;
+    return { active: active.current!, inactive: inactive.current! };
+  }, []);
 
-      const [h, s, l] = CATEGORY_COLORS[categoryId] ?? [220, 70, 60];
+  const renderMask = useCallback(
+    (maskB64: string, categoryId: number) => {
+      if (clearTimerRef.current) { clearTimeout(clearTimerRef.current); clearTimerRef.current = null; }
+
+      const { active: oldCanvas, inactive: newCanvas } = getOverlayRefs();
 
       const maskImg = new window.Image();
       maskImg.onload = () => {
         const tmp = document.createElement("canvas");
-        tmp.width = overlay.width;
-        tmp.height = overlay.height;
+        tmp.width = newCanvas.width;
+        tmp.height = newCanvas.height;
         const tmpCtx = tmp.getContext("2d")!;
-        tmpCtx.drawImage(maskImg, 0, 0, overlay.width, overlay.height);
-        const maskData = tmpCtx.getImageData(0, 0, overlay.width, overlay.height);
+        tmpCtx.drawImage(maskImg, 0, 0, newCanvas.width, newCanvas.height);
+        const maskData = tmpCtx.getImageData(0, 0, newCanvas.width, newCanvas.height);
         maskImageDataRef.current = maskData;
 
-        const out = ctx.createImageData(overlay.width, overlay.height);
-        const rgb = hslToRgb(h, s, l);
+        const ctx = newCanvas.getContext("2d")!;
+        ctx.clearRect(0, 0, newCanvas.width, newCanvas.height);
 
-        for (let i = 0; i < maskData.data.length; i += 4) {
-          const a = maskData.data[i];
-          if (a > 20) {
-            const n = Math.min(a / 255, 1);
-            const op = mode === "selected" ? n * 0.38 : n * 0.22;
-            out.data[i] = rgb[0];
-            out.data[i + 1] = rgb[1];
-            out.data[i + 2] = rgb[2];
-            out.data[i + 3] = Math.floor(op * 255);
+        const focused = focusDimmedRef.current;
+        if (focused) {
+          // Build alpha mask from the R channel, then composite original image through it
+          const alphaMask = ctx.createImageData(newCanvas.width, newCanvas.height);
+          for (let i = 0; i < maskData.data.length; i += 4) {
+            const v = maskData.data[i];
+            if (v > 20) {
+              alphaMask.data[i] = 255;
+              alphaMask.data[i + 1] = 255;
+              alphaMask.data[i + 2] = 255;
+              alphaMask.data[i + 3] = v;
+            }
           }
+          ctx.putImageData(alphaMask, 0, 0);
+          ctx.globalCompositeOperation = "source-in";
+          ctx.drawImage(canvasRef.current!, 0, 0);
+          ctx.globalCompositeOperation = "source-over";
+        } else {
+          const out = ctx.createImageData(newCanvas.width, newCanvas.height);
+          for (let i = 0; i < maskData.data.length; i += 4) {
+            const a = maskData.data[i];
+            if (a > 20) {
+              const n = Math.min(a / 255, 1);
+              const soft = n * n * n * n;
+              out.data[i] = 255;
+              out.data[i + 1] = 245;
+              out.data[i + 2] = 235;
+              out.data[i + 3] = Math.floor(soft * 0.03 * 255);
+            }
+          }
+          ctx.putImageData(out, 0, 0);
         }
-        ctx.putImageData(out, 0, 0);
 
-        // Edge glow
-        ctx.globalCompositeOperation = "source-over";
-        ctx.filter = "blur(4px)";
-        ctx.globalAlpha = mode === "selected" ? 0.35 : 0.2;
-        ctx.drawImage(overlay, 0, 0);
-        ctx.filter = "none";
-        ctx.globalAlpha = 1;
-
-        startShimmer(maskData, h);
+        // Crossfade
+        newCanvas.style.opacity = "0";
+        requestAnimationFrame(() => {
+          newCanvas.style.opacity = "1";
+          oldCanvas.style.opacity = "0";
+        });
+        activeOverlayRef.current = activeOverlayRef.current === "A" ? "B" : "A";
       };
       maskImg.src = `data:image/png;base64,${maskB64}`;
     },
-    [startShimmer]
+    [getOverlayRefs]
   );
 
   const clearOverlay = useCallback(() => {
-    stopShimmer();
-    if (!overlayRef.current) return;
-    const ctx = overlayRef.current.getContext("2d")!;
-    ctx.clearRect(0, 0, overlayRef.current.width, overlayRef.current.height);
-  }, [stopShimmer]);
+    for (const ref of [overlayARef, overlayBRef]) {
+      if (ref.current) ref.current.style.opacity = "0";
+    }
+    if (clearTimerRef.current) clearTimeout(clearTimerRef.current);
+    clearTimerRef.current = setTimeout(() => {
+      for (const ref of [overlayARef, overlayBRef]) {
+        if (!ref.current) continue;
+        const ctx = ref.current.getContext("2d")!;
+        ctx.clearRect(0, 0, ref.current.width, ref.current.height);
+      }
+    }, 320);
+  }, []);
+
+  const dismissFocus = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (canvas) {
+      setFocusBox({ x: 0, y: 0, w: canvas.width, h: canvas.height });
+    }
+    setFocusDimmed(false);
+    focusDimmedRef.current = false;
+    setTimeout(() => setFocusBox(null), 400);
+  }, []);
 
   const handleMouseLeave = useCallback(() => {
     clearOverlay();
-    setHoveredCategory("");
     lastCategoryRef.current = -1;
   }, [clearOverlay]);
 
@@ -262,7 +251,22 @@ export default function Home() {
       hoverThrottleRef.current = now;
 
       const rect = canvasRef.current!.getBoundingClientRect();
-      const { x, y } = canvasToModelCoords(e.clientX - rect.left, e.clientY - rect.top);
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+
+      // If focused and cursor is inside the focus box, do nothing
+      if (focusDimmedRef.current && focusBox) {
+        if (cx >= focusBox.x && cx <= focusBox.x + focusBox.w &&
+            cy >= focusBox.y && cy <= focusBox.y + focusBox.h) {
+          if (lastCategoryRef.current !== -1) {
+            lastCategoryRef.current = -1;
+            clearOverlay();
+          }
+          return;
+        }
+      }
+
+      const { x, y } = canvasToModelCoords(cx, cy);
       const canvas = canvasRef.current!;
 
       try {
@@ -270,43 +274,123 @@ export default function Home() {
         if (result.mask) {
           if (result.categoryId === lastCategoryRef.current) return;
           lastCategoryRef.current = result.categoryId;
-          setHoveredCategory(result.category);
-          renderMask(result.mask, result.categoryId, "hover");
+          lastHoverResultRef.current = { mask: result.mask, category: result.category, categoryId: result.categoryId };
+          renderMask(result.mask, result.categoryId);
         } else {
           lastCategoryRef.current = -1;
-          setHoveredCategory("");
+          lastHoverResultRef.current = null;
           clearOverlay();
         }
       } catch {}
     },
-    [stage, canvasToModelCoords, renderMask, clearOverlay]
+    [stage, canvasToModelCoords, renderMask, clearOverlay, focusBox]
   );
 
+  const animateFocusBox = useCallback((bbox: { x: number; y: number; w: number; h: number }) => {
+    const canvas = canvasRef.current!;
+    // Clamp box within canvas bounds with inset so corners don't touch edges
+    const inset = 14;
+    const maxW = Math.min(bbox.w, canvas.width - inset * 2);
+    const maxH = Math.min(bbox.h, canvas.height - inset * 2);
+    const clamped = {
+      x: Math.max(inset, Math.min(bbox.x, canvas.width - maxW - inset)),
+      y: Math.max(inset, Math.min(bbox.y, canvas.height - maxH - inset)),
+      w: maxW,
+      h: maxH,
+    };
+    if (!focusDimmedRef.current) {
+      setFocusBox({ x: 0, y: 0, w: canvas.width, h: canvas.height });
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          setFocusBox(clamped);
+          setFocusDimmed(true);
+          focusDimmedRef.current = true;
+        });
+      });
+    } else {
+      setFocusBox(clamped);
+    }
+  }, []);
+
+  const decodeMaskToBbox = useCallback((maskB64: string, canvasW: number, canvasH: number): Promise<{ x: number; y: number; w: number; h: number } | null> => {
+    return new Promise((resolve) => {
+      const maskImg = new window.Image();
+      maskImg.onload = () => {
+        const tmp = document.createElement("canvas");
+        tmp.width = canvasW;
+        tmp.height = canvasH;
+        const tmpCtx = tmp.getContext("2d")!;
+        tmpCtx.drawImage(maskImg, 0, 0, canvasW, canvasH);
+        const maskData = tmpCtx.getImageData(0, 0, canvasW, canvasH);
+        resolve(computeBboxFromMask(maskData));
+      };
+      maskImg.src = `data:image/png;base64,${maskB64}`;
+    });
+  }, []);
+
   const handleClick = useCallback(
-    async (e: React.MouseEvent<HTMLElement>) => {
+    (e: React.MouseEvent<HTMLElement>) => {
       if (stage !== "ready" || !hashRef.current) return;
       const rect = canvasRef.current!.getBoundingClientRect();
-      const { x, y } = canvasToModelCoords(e.clientX - rect.left, e.clientY - rect.top);
-      const canvas = canvasRef.current!;
+      const canvasX = e.clientX - rect.left;
+      const canvasY = e.clientY - rect.top;
 
-      try {
-        const result = await decodeMask(hashRef.current, x, y, canvas.width, canvas.height);
-        if (!result.mask) return;
-        renderMask(result.mask, result.categoryId, "selected");
-        setSelectedCategory(result.category);
-
-        setSearching(true);
-        setProducts([]);
-        setSearchQuery("");
-        const sr = await searchProducts(hashRef.current, result.categoryId);
-        setSearchQuery(sr.query);
-        setProducts(sr.products);
-        setSearching(false);
-      } catch {
-        setSearching(false);
+      // Click inside the focus box → dismiss it
+      if (focusDimmedRef.current && focusBox) {
+        if (canvasX >= focusBox.x && canvasX <= focusBox.x + focusBox.w &&
+            canvasY >= focusBox.y && canvasY <= focusBox.y + focusBox.h) {
+          dismissFocus();
+          clearOverlay();
+          setProducts([]);
+          setSearchQuery("");
+          setSelectedCategory("");
+          lastCategoryRef.current = -1;
+          return;
+        }
       }
+      const { x, y } = canvasToModelCoords(canvasX, canvasY);
+      const canvas = canvasRef.current!;
+      const hash = hashRef.current;
+
+      const gen = ++clickGenRef.current;
+
+      clearOverlay();
+      setSearching(true);
+      setProducts([]);
+      setSearchQuery("");
+
+      decodeMask(hash, x, y, canvas.width, canvas.height).then((result) => {
+        if (clickGenRef.current !== gen) return; // stale click, discard
+
+        if (result.mask) {
+          decodeMaskToBbox(result.mask, canvas.width, canvas.height).then((bbox) => {
+            if (clickGenRef.current !== gen) return;
+            if (bbox) animateFocusBox(bbox);
+          });
+
+          setSelectedCategory(result.category);
+
+          searchProducts(hash, result.categoryId).then((sr) => {
+            if (clickGenRef.current !== gen) return;
+            setSearchQuery(sr.query);
+            setProducts(sr.products);
+            setSearching(false);
+          }).catch(() => {
+            if (clickGenRef.current === gen) setSearching(false);
+          });
+        } else {
+          const size = 120;
+          const bx = Math.max(0, Math.min(canvas.width - size, canvasX - size / 2));
+          const by = Math.max(0, Math.min(canvas.height - size, canvasY - size / 2));
+          animateFocusBox({ x: bx, y: by, w: size, h: size });
+          setSelectedCategory("");
+          setSearching(false);
+        }
+      }).catch(() => {
+        if (clickGenRef.current === gen) setSearching(false);
+      });
     },
-    [stage, canvasToModelCoords, renderMask]
+    [stage, canvasToModelCoords, clearOverlay, animateFocusBox, decodeMaskToBbox, focusBox, dismissFocus]
   );
 
   const handleDrop = useCallback(
@@ -325,8 +409,20 @@ export default function Home() {
     setProducts([]);
     setSearchQuery("");
     setSelectedCategory("");
+    setFocusBox(null);
+    setFocusDimmed(false);
+    focusDimmedRef.current = false;
     hashRef.current = "";
   };
+
+  const closePanel = useCallback(() => {
+    setProducts([]);
+    setSearchQuery("");
+    setSelectedCategory("");
+    dismissFocus();
+    clearOverlay();
+    lastCategoryRef.current = -1;
+  }, [dismissFocus, clearOverlay]);
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 relative overflow-hidden">
@@ -380,7 +476,6 @@ export default function Home() {
                 onDragLeave={() => setDragging(false)}
                 onDrop={(e) => { setDragging(false); handleDrop(e); }}
               >
-                {/* Hover gradient border */}
                 <div className={`absolute inset-[-1px] rounded-2xl bg-gradient-to-br from-purple-500/0 via-transparent to-blue-500/0 group-hover:from-purple-500/20 group-hover:to-blue-500/20 transition-all duration-700 pointer-events-none ${dragging ? "from-purple-500/20 to-blue-500/20" : ""}`} />
 
                 <div className="relative flex flex-col items-center gap-5">
@@ -436,19 +531,47 @@ export default function Home() {
 
               {/* Canvas stack */}
               <div className="relative inline-block rounded-2xl overflow-hidden shadow-2xl shadow-black/50 ring-1 ring-white/[0.06]">
-                {hoveredCategory && (
-                  <div className="absolute -top-11 left-1/2 z-20 pointer-events-none animate-float-label">
-                    <div className="bg-zinc-900/95 backdrop-blur-xl border border-white/[0.1] text-zinc-100 text-xs font-medium px-4 py-2 rounded-full shadow-xl shadow-black/40 whitespace-nowrap">
-                      {hoveredCategory}
-                    </div>
+                <canvas ref={canvasRef} className="block" />
+                <canvas ref={overlayARef} className="absolute inset-0 w-full h-full pointer-events-none transition-opacity duration-300 ease-out" style={{ zIndex: 11 }} />
+                <canvas ref={overlayBRef} className="absolute inset-0 w-full h-full pointer-events-none transition-opacity duration-300 ease-out" style={{ zIndex: 11 }} />
+                {/* Focus box overlay */}
+                {focusBox && (
+                  <div
+                    className="absolute pointer-events-none focus-box-transition"
+                    style={{
+                      left: focusBox.x,
+                      top: focusBox.y,
+                      width: focusBox.w,
+                      height: focusBox.h,
+                      borderRadius: 12,
+                      boxShadow: focusDimmed
+                        ? "0 0 0 9999px rgba(0, 0, 0, 0.45)"
+                        : "0 0 0 9999px rgba(0, 0, 0, 0)",
+                      zIndex: 10,
+                    }}
+                  >
+                    {/* Top-right corner */}
+                    <svg
+                      className="absolute focus-box-transition"
+                      style={{ top: -10, right: -10, opacity: focusDimmed ? 1 : 0, zIndex: 12 }}
+                      width="24" height="24" viewBox="0 0 24 24" fill="none"
+                    >
+                      <path d="M2 2A20 20 0 0 1 22 22" stroke="rgba(255,255,255,0.85)" strokeWidth="4.5" strokeLinecap="round" />
+                    </svg>
+                    {/* Bottom-left corner */}
+                    <svg
+                      className="absolute focus-box-transition"
+                      style={{ bottom: -10, left: -10, opacity: focusDimmed ? 1 : 0, zIndex: 12 }}
+                      width="24" height="24" viewBox="0 0 24 24" fill="none"
+                    >
+                      <path d="M22 22A20 20 0 0 1 2 2" stroke="rgba(255,255,255,0.85)" strokeWidth="4.5" strokeLinecap="round" />
+                    </svg>
                   </div>
                 )}
-                <canvas ref={canvasRef} className="block" />
-                <canvas ref={overlayRef} className="absolute inset-0 w-full h-full pointer-events-none" />
-                <canvas ref={shimmerRef} className="absolute inset-0 w-full h-full pointer-events-none" />
+
                 <div
                   className="absolute inset-0"
-                  style={{ cursor: stage === "ready" ? "pointer" : "default" }}
+                  style={{ cursor: stage === "ready" ? "pointer" : "default", zIndex: 20 }}
                   onMouseMove={handleHover}
                   onMouseLeave={handleMouseLeave}
                   onClick={handleClick}
@@ -479,7 +602,7 @@ export default function Home() {
                   )}
                 </div>
                 <button
-                  onClick={() => { setProducts([]); setSearchQuery(""); setSelectedCategory(""); handleMouseLeave(); }}
+                  onClick={closePanel}
                   className="text-zinc-600 hover:text-zinc-300 transition-colors p-1"
                 >
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -544,13 +667,4 @@ export default function Home() {
       </div>
     </div>
   );
-}
-
-function hslToRgb(h: number, s: number, l: number): [number, number, number] {
-  s /= 100;
-  l /= 100;
-  const k = (n: number) => (n + h / 30) % 12;
-  const a = s * Math.min(l, 1 - l);
-  const f = (n: number) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
-  return [Math.round(f(0) * 255), Math.round(f(8) * 255), Math.round(f(4) * 255)];
 }

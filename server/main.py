@@ -2,7 +2,6 @@ import io
 import os
 import base64
 import hashlib
-from collections import Counter
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -21,6 +20,7 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageFilter
+from qdrant_client import QdrantClient
 
 app = FastAPI()
 app.add_middleware(
@@ -30,7 +30,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_EMBED_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={GEMINI_API_KEY}"
+
+qdrant: QdrantClient | None = None
+QDRANT_COLLECTION = "fashionpedia"
 
 LABELS = {
     0: "Background",
@@ -139,34 +143,41 @@ def dominant_color_name(img: Image.Image, mask: np.ndarray) -> str:
     return "pink"
 
 
-def search_products(query: str) -> list[dict]:
-    """Search Google Shopping via Serper.dev API."""
-    if not SERPER_API_KEY:
+def embed_query(text: str) -> list[float]:
+    """Embed a single query using Gemini."""
+    resp = http_requests.post(
+        GEMINI_EMBED_URL,
+        json={"model": "models/gemini-embedding-001", "content": {"parts": [{"text": text}]}},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()["embedding"]["values"]
+
+
+def search_qdrant(query: str, limit: int = 8) -> list[dict]:
+    """Vector search on Qdrant using Gemini embeddings."""
+    if not qdrant or not GEMINI_API_KEY:
         return []
 
     try:
-        resp = http_requests.post(
-            "https://google.serper.dev/shopping",
-            json={"q": query, "num": 8},
-            headers={
-                "X-API-KEY": SERPER_API_KEY,
-                "Content-Type": "application/json",
-            },
-            timeout=5,
+        vector = embed_query(query)
+        results = qdrant.query_points(
+            collection_name=QDRANT_COLLECTION,
+            query=vector,
+            limit=limit,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        results = []
-        for item in data.get("shopping", [])[:8]:
-            results.append({
-                "id": item.get("position", 0),
-                "name": item.get("title", ""),
-                "price": item.get("price", ""),
-                "image": item.get("imageUrl", ""),
-                "brand": item.get("source", ""),
-                "link": item.get("link", ""),
+        items = []
+        for point in results.points:
+            p = point.payload
+            items.append({
+                "id": point.id,
+                "name": p.get("description", ""),
+                "price": "",
+                "image": p.get("image_url", ""),
+                "brand": ", ".join(p.get("attributes", [])[:3]),
+                "link": "",
             })
-        return results
+        return items
     except Exception as e:
         print(f"[search] error: {e}")
         return []
@@ -174,7 +185,16 @@ def search_products(query: str) -> list[dict]:
 
 @app.on_event("startup")
 async def startup():
+    global qdrant
     get_model()
+
+    qdrant_url = os.environ.get("QDRANT_URL", "")
+    qdrant_key = os.environ.get("QDRANT_API_KEY", "")
+    if qdrant_url and qdrant_key:
+        qdrant = QdrantClient(url=qdrant_url, api_key=qdrant_key)
+        print(f"Connected to Qdrant at {qdrant_url}")
+    else:
+        print("WARNING: QDRANT_URL / QDRANT_API_KEY not set, search disabled")
 
 
 @app.post("/api/encode")
@@ -291,7 +311,7 @@ async def search_item(body: dict):
 
     print(f"[search] category={LABELS[category_id]} color={color} query=\"{query}\"")
 
-    products = search_products(query)
+    products = search_qdrant(query)
 
     return {
         "query": query,
@@ -301,5 +321,4 @@ async def search_item(body: dict):
 
 @app.get("/api/health")
 async def health():
-    has_key = bool(SERPER_API_KEY)
-    return {"status": "ok", "searchEnabled": has_key}
+    return {"status": "ok", "searchEnabled": qdrant is not None and bool(GEMINI_API_KEY)}
