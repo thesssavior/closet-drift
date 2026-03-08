@@ -4,3 +4,5 @@ models/
 .env
 .env.local
 data/train_images/
+data/fashionpedia_train.json
+fashionpedia/
