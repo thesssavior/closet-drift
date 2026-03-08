@@ -18,11 +18,11 @@ type Stage = "idle" | "encoding" | "ready";
 
 const SAMPLE_PHOTOS = [
   { src: "/samples/1.jpeg", width: 736, height: 1104 },
+  { src: "/samples/6.jpg", width: 1920, height: 1280 },
   { src: "/samples/2.jpg", width: 1707, height: 2560 },
-  { src: "/samples/3.jpg", width: 540, height: 360 },
   { src: "/samples/4.jpg", width: 1110, height: 1665 },
   { src: "/samples/5.jpg", width: 1024, height: 683 },
-  { src: "/samples/6.jpg", width: 1920, height: 1280 },
+  { src: "/samples/3.jpg", width: 540, height: 360 },
 ];
 
 function computeBboxFromMask(maskData: ImageData, padding = 16) {
