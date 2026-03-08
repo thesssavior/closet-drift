@@ -1,12 +1,14 @@
 "use client";
 
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, Suspense } from "react";
+import { useSearchParams, useRouter } from "next/navigation";
 import { MasonryPhotoAlbum } from "react-photo-album";
 import "react-photo-album/masonry.css";
 import {
   encodeImage,
   decodeMask,
   searchProducts,
+  findSimilar,
   fetchClothingMask,
   API_BASE,
   type Product,
@@ -46,7 +48,18 @@ function computeBboxFromMask(maskData: ImageData, padding = 16) {
   return { x, y, w, h };
 }
 
-export default function Home() {
+export default function Page() {
+  return (
+    <Suspense>
+      <Home />
+    </Suspense>
+  );
+}
+
+function Home() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
   const [stage, setStage] = useState<Stage>("idle");
   const [statusText, setStatusText] = useState("");
   const [imageSrc, setImageSrc] = useState<string | null>(null);
@@ -60,6 +73,14 @@ export default function Home() {
   const [focusBox, setFocusBox] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [focusDimmed, setFocusDimmed] = useState(false);
   const [failedImages, setFailedImages] = useState<Set<string>>(new Set());
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const offsetRef = useRef(0);
+  // Track current similar-search point ID for infinite scroll
+  const similarIdRef = useRef<number | null>(null);
+  // Track current text-search params for infinite scroll
+  const textSearchRef = useRef<{ hash: string; categoryId: number } | null>(null);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -77,10 +98,14 @@ export default function Home() {
   const clearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const focusDimmedRef = useRef(false);
   const clickGenRef = useRef(0);
-  const dripRef = useRef<HTMLCanvasElement>(null);
-  const dripMaskCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const dripRafRef = useRef<number>(0);
   const startDripRef = useRef<((maskB64: string) => void) | null>(null);
+  const dripMaskUrlRef = useRef<string | null>(null);
+  const fullMaskB64Ref = useRef<string | null>(null);
+  const focusMaskUrlRef = useRef<string | null>(null);
+  const [dripState, setDripState] = useState<{ maskUrl: string; width: number; height: number } | null>(null);
+  const [dripVisible, setDripVisible] = useState(false);
+  const [focusMaskUrl, setFocusMaskUrl] = useState<string | null>(null);
+  const dripId = useRef(`d${Math.random().toString(36).slice(2, 8)}`).current;
 
   const drawImage = useCallback((img: HTMLImageElement) => {
     const canvas = canvasRef.current;
@@ -96,7 +121,7 @@ export default function Home() {
 
     canvas.width = w;
     canvas.height = h;
-    for (const ref of [overlayARef, overlayBRef, dripRef]) {
+    for (const ref of [overlayARef, overlayBRef]) {
       if (ref.current) { ref.current.width = w; ref.current.height = h; }
     }
     ctx.drawImage(img, 0, 0, w, h);
@@ -124,6 +149,31 @@ export default function Home() {
     observer.observe(container);
     return () => observer.disconnect();
   }, [drawImage]);
+
+  // URL-driven search: handle ?s=<pointId> for find-similar
+  useEffect(() => {
+    const sParam = searchParams.get("s");
+    if (!sParam) return;
+    const pointId = parseInt(sParam, 10);
+    if (isNaN(pointId)) return;
+
+    similarIdRef.current = pointId;
+    textSearchRef.current = null;
+    offsetRef.current = 0;
+    setHasMore(true);
+    setSelectedCategory("similar");
+    setSearching(true);
+    setProducts([]);
+    setFailedImages(new Set());
+
+    findSimilar(pointId).then((sr) => {
+      setSearchQuery(sr.query);
+      setProducts(sr.products);
+      setSearching(false);
+      setHasMore(sr.products.length >= 100);
+      offsetRef.current = sr.products.length;
+    }).catch(() => setSearching(false));
+  }, [searchParams]);
 
   const canvasToModelCoords = useCallback(
     (canvasX: number, canvasY: number) => {
@@ -303,119 +353,96 @@ export default function Home() {
   }, []);
 
   const startDrip = useCallback((maskB64: string) => {
-    const drip = dripRef.current;
-    if (!drip) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    fullMaskB64Ref.current = maskB64;
+    const w = canvas.width, h = canvas.height;
 
     const maskImg = new window.Image();
     maskImg.onload = () => {
-      const w = drip.width;
-      const h = drip.height;
+      // Create feathered mask: blur edges + gamma curve
+      const tmp = document.createElement("canvas");
+      tmp.width = w; tmp.height = h;
+      const ctx = tmp.getContext("2d")!;
+      ctx.filter = "blur(8px)";
+      ctx.drawImage(maskImg, 0, 0, w, h);
+      ctx.filter = "none";
 
-      const maskCanvas = document.createElement("canvas");
-      maskCanvas.width = w;
-      maskCanvas.height = h;
-      const maskCtx = maskCanvas.getContext("2d")!;
-      maskCtx.drawImage(maskImg, 0, 0, w, h);
-      const raw = maskCtx.getImageData(0, 0, w, h);
-      for (let i = 0; i < raw.data.length; i += 4) {
-        const v = raw.data[i];
-        raw.data[i] = 255;
-        raw.data[i + 1] = 255;
-        raw.data[i + 2] = 255;
-        raw.data[i + 3] = v > 20 ? v : 0;
+      const d = ctx.getImageData(0, 0, w, h);
+      for (let i = 0; i < d.data.length; i += 4) {
+        const v = d.data[i] / 255;
+        d.data[i] = 255;
+        d.data[i + 1] = 255;
+        d.data[i + 2] = 255;
+        d.data[i + 3] = Math.round(v * v * 255); // gamma exponent=2
       }
-      maskCtx.putImageData(raw, 0, 0);
-      dripMaskCanvasRef.current = maskCanvas;
+      ctx.putImageData(d, 0, 0);
 
-      const gradCanvas = document.createElement("canvas");
-      gradCanvas.width = w;
-      gradCanvas.height = h;
-      const gradCtx = gradCanvas.getContext("2d")!;
-      const baseGrad = gradCtx.createLinearGradient(0, 0, w, h);
-      baseGrad.addColorStop(0, "rgba(120, 60, 255, 0.25)");
-      baseGrad.addColorStop(0.2, "rgba(80, 120, 255, 0.22)");
-      baseGrad.addColorStop(0.4, "rgba(60, 200, 220, 0.18)");
-      baseGrad.addColorStop(0.6, "rgba(80, 220, 120, 0.16)");
-      baseGrad.addColorStop(0.8, "rgba(255, 200, 60, 0.18)");
-      baseGrad.addColorStop(1, "rgba(255, 80, 80, 0.25)");
-      gradCtx.fillStyle = baseGrad;
-      gradCtx.fillRect(0, 0, w, h);
-      gradCtx.globalCompositeOperation = "destination-in";
-      gradCtx.drawImage(maskCanvas, 0, 0);
-      gradCtx.globalCompositeOperation = "source-over";
-
-      drip.style.opacity = "1";
-      const ctx = drip.getContext("2d")!;
-      const radius = Math.max(w, h) * 0.9;
-      let start: number | null = null;
-      const sweepDuration = 6000;
-      const pauseDuration = 10000;
-      const cycleDuration = sweepDuration + pauseDuration;
-
-      const blobCanvas = document.createElement("canvas");
-      blobCanvas.width = w;
-      blobCanvas.height = h;
-
-      const animate = (ts: number) => {
-        if (!start) start = ts;
-        const elapsed = ((ts - start) % cycleDuration);
-
-        if (elapsed >= sweepDuration) {
-          ctx.clearRect(0, 0, w, h);
-          dripRafRef.current = requestAnimationFrame(animate);
-          return;
-        }
-
-        const raw = elapsed / sweepDuration;
-        const t = raw < 0.5
-          ? 2 * raw * raw
-          : 1 - 2 * (1 - raw) * (1 - raw);
-        const cx = -radius * 0.2 + (w + radius * 0.4) * t;
-        const cy = -radius * 0.2 + (h + radius * 0.4) * t;
-        const edgeFade = Math.min(raw / 0.2, 1) * Math.min((1 - raw) / 0.2, 1);
-        const smoothFade = edgeFade * edgeFade * (3 - 2 * edgeFade);
-
-        const bCtx = blobCanvas.getContext("2d")!;
-        bCtx.clearRect(0, 0, w, h);
-        const fog = bCtx.createRadialGradient(cx, cy, 0, cx, cy, radius);
-        fog.addColorStop(0, "rgba(255,255,255,1)");
-        fog.addColorStop(0.3, "rgba(255,255,255,0.8)");
-        fog.addColorStop(0.6, "rgba(255,255,255,0.3)");
-        fog.addColorStop(0.85, "rgba(255,255,255,0.05)");
-        fog.addColorStop(1, "rgba(255,255,255,0)");
-        bCtx.fillStyle = fog;
-        bCtx.fillRect(0, 0, w, h);
-
-        ctx.clearRect(0, 0, w, h);
-        ctx.globalAlpha = smoothFade;
-        ctx.drawImage(gradCanvas, 0, 0);
-
-        ctx.globalCompositeOperation = "destination-in";
-        ctx.drawImage(blobCanvas, 0, 0);
-        ctx.globalCompositeOperation = "source-over";
-        ctx.globalAlpha = 1;
-
-        dripRafRef.current = requestAnimationFrame(animate);
-      };
-      dripRafRef.current = requestAnimationFrame(animate);
+      tmp.toBlob((blob) => {
+        if (!blob) return;
+        const url = URL.createObjectURL(blob);
+        if (dripMaskUrlRef.current) URL.revokeObjectURL(dripMaskUrlRef.current);
+        dripMaskUrlRef.current = url;
+        setDripState({ maskUrl: url, width: w, height: h });
+        setDripVisible(true);
+      });
     };
     maskImg.src = `data:image/png;base64,${maskB64}`;
   }, []);
   startDripRef.current = startDrip;
 
   const stopDrip = useCallback(() => {
-    if (dripRafRef.current) {
-      cancelAnimationFrame(dripRafRef.current);
-      dripRafRef.current = 0;
-    }
-    const drip = dripRef.current;
-    if (drip) {
-      drip.style.opacity = "0";
-      setTimeout(() => {
-        const ctx = drip.getContext("2d");
-        if (ctx) ctx.clearRect(0, 0, drip.width, drip.height);
-      }, 300);
-    }
+    setDripVisible(false);
+  }, []);
+
+  const buildFocusMask = useCallback((garmentB64: string, w: number, h: number) => {
+    const fullB64 = fullMaskB64Ref.current;
+    if (!fullB64) return;
+    const loadImg = (src: string): Promise<HTMLImageElement> => new Promise((res) => {
+      const img = new window.Image();
+      img.onload = () => res(img);
+      img.src = `data:image/png;base64,${src}`;
+    });
+    Promise.all([loadImg(fullB64), loadImg(garmentB64)]).then(([fullImg, garmentImg]) => {
+      // Draw full clothing mask, subtract selected garment
+      const tmp = document.createElement("canvas");
+      tmp.width = w; tmp.height = h;
+      const ctx = tmp.getContext("2d")!;
+      ctx.drawImage(fullImg, 0, 0, w, h);
+      const fd = ctx.getImageData(0, 0, w, h);
+      const gTmp = document.createElement("canvas");
+      gTmp.width = w; gTmp.height = h;
+      const gCtx = gTmp.getContext("2d")!;
+      gCtx.drawImage(garmentImg, 0, 0, w, h);
+      const gd = gCtx.getImageData(0, 0, w, h);
+      for (let i = 0; i < fd.data.length; i += 4) {
+        if (gd.data[i] > 20) { fd.data[i] = 0; fd.data[i + 1] = 0; fd.data[i + 2] = 0; }
+      }
+      ctx.putImageData(fd, 0, 0);
+
+      // Blur for feathered edges, then gamma
+      const tmp2 = document.createElement("canvas");
+      tmp2.width = w; tmp2.height = h;
+      const ctx2 = tmp2.getContext("2d")!;
+      ctx2.filter = "blur(8px)";
+      ctx2.drawImage(tmp, 0, 0);
+      ctx2.filter = "none";
+      const d = ctx2.getImageData(0, 0, w, h);
+      for (let i = 0; i < d.data.length; i += 4) {
+        const v = d.data[i] / 255;
+        d.data[i] = 255; d.data[i + 1] = 255; d.data[i + 2] = 255;
+        d.data[i + 3] = Math.round(v * v * 255);
+      }
+      ctx2.putImageData(d, 0, 0);
+
+      tmp2.toBlob((blob) => {
+        if (!blob) return;
+        const url = URL.createObjectURL(blob);
+        if (focusMaskUrlRef.current) URL.revokeObjectURL(focusMaskUrlRef.current);
+        focusMaskUrlRef.current = url;
+        setFocusMaskUrl(url);
+      });
+    });
   }, []);
 
   const dismissFocus = useCallback(() => {
@@ -425,8 +452,11 @@ export default function Home() {
     }
     setFocusDimmed(false);
     focusDimmedRef.current = false;
+    setFocusMaskUrl(null);
+    if (focusMaskUrlRef.current) { URL.revokeObjectURL(focusMaskUrlRef.current); focusMaskUrlRef.current = null; }
     setTimeout(() => setFocusBox(null), 400);
-    if (hashRef.current && canvas) {
+    // Restart drip if it was cleared (e.g. by reset)
+    if (!dripMaskUrlRef.current && hashRef.current && canvas) {
       fetchClothingMask(hashRef.current, canvas.width, canvas.height)
         .then((r) => { if (r.mask) startDrip(r.mask); })
         .catch(() => {});
@@ -546,7 +576,6 @@ export default function Home() {
 
       const gen = ++clickGenRef.current;
 
-      stopDrip();
       clearOverlay();
       setSearching(true);
       setProducts([]); setFailedImages(new Set());
@@ -560,14 +589,26 @@ export default function Home() {
             if (clickGenRef.current !== gen) return;
             if (bbox) animateFocusBox(bbox);
           });
+          buildFocusMask(result.mask, canvas.width, canvas.height);
 
           setSelectedCategory(result.category);
+          textSearchRef.current = { hash, categoryId: result.categoryId };
+          similarIdRef.current = null;
+          offsetRef.current = 0;
+          setHasMore(true);
 
           searchProducts(hash, result.categoryId).then((sr) => {
             if (clickGenRef.current !== gen) return;
             setSearchQuery(sr.query);
             setProducts(sr.products);
             setSearching(false);
+            setHasMore(sr.products.length >= 100);
+            offsetRef.current = sr.products.length;
+            // Push URL state
+            const params = new URLSearchParams();
+            params.set("q", sr.query);
+            params.set("cat", String(result.categoryId));
+            router.push(`/?${params.toString()}`, { scroll: false });
           }).catch(() => {
             if (clickGenRef.current === gen) setSearching(false);
           });
@@ -583,8 +624,62 @@ export default function Home() {
         if (clickGenRef.current === gen) setSearching(false);
       });
     },
-    [stage, canvasToModelCoords, clearOverlay, animateFocusBox, decodeMaskToBbox, focusBox, dismissFocus, stopDrip]
+    [stage, canvasToModelCoords, clearOverlay, animateFocusBox, decodeMaskToBbox, focusBox, dismissFocus, buildFocusMask]
   );
+
+  // Handle clicking a product card → find similar
+  const handleProductClick = useCallback((product: Product) => {
+    similarIdRef.current = product.id;
+    textSearchRef.current = null;
+    offsetRef.current = 0;
+    setHasMore(true);
+    setSelectedCategory("similar");
+    setSearching(true);
+    setProducts([]);
+    setFailedImages(new Set());
+
+    router.push(`/?s=${product.id}`, { scroll: false });
+
+    findSimilar(product.id).then((sr) => {
+      setSearchQuery(sr.query);
+      setProducts(sr.products);
+      setSearching(false);
+      setHasMore(sr.products.length >= 100);
+      offsetRef.current = sr.products.length;
+    }).catch(() => setSearching(false));
+  }, [router]);
+
+  // Infinite scroll: load more when sentinel enters viewport
+  const loadMore = useCallback(() => {
+    if (loadingMore || !hasMore) return;
+    setLoadingMore(true);
+
+    const fetchNext = similarIdRef.current != null
+      ? findSimilar(similarIdRef.current, 100, offsetRef.current)
+      : textSearchRef.current
+        ? searchProducts(textSearchRef.current.hash, textSearchRef.current.categoryId, 100, offsetRef.current)
+        : null;
+
+    if (!fetchNext) { setLoadingMore(false); return; }
+
+    fetchNext.then((sr) => {
+      setProducts((prev) => [...prev, ...sr.products]);
+      offsetRef.current += sr.products.length;
+      setHasMore(sr.products.length >= 100);
+      setLoadingMore(false);
+    }).catch(() => setLoadingMore(false));
+  }, [loadingMore, hasMore]);
+
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    if (!sentinel) return;
+    const observer = new IntersectionObserver(
+      (entries) => { if (entries[0].isIntersecting) loadMore(); },
+      { rootMargin: "400px" }
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [loadMore]);
 
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
@@ -596,8 +691,12 @@ export default function Home() {
   );
 
   const reset = () => {
-    console.log("[reset] called, current imageSrc:", imageSrc);
     stopDrip();
+    setDripState(null);
+    if (dripMaskUrlRef.current) { URL.revokeObjectURL(dripMaskUrlRef.current); dripMaskUrlRef.current = null; }
+    setFocusMaskUrl(null);
+    if (focusMaskUrlRef.current) { URL.revokeObjectURL(focusMaskUrlRef.current); focusMaskUrlRef.current = null; }
+    fullMaskB64Ref.current = null;
     setImageSrc(null);
     setStage("idle");
     setStatusText("");
@@ -608,7 +707,10 @@ export default function Home() {
     setFocusDimmed(false);
     focusDimmedRef.current = false;
     hashRef.current = "";
+    similarIdRef.current = null;
+    textSearchRef.current = null;
     setLandingKey((k) => k + 1);
+    router.push("/", { scroll: false });
   };
 
   const closePanel = useCallback(() => {
@@ -631,7 +733,7 @@ export default function Home() {
             </h1>
           </button>
           {imageSrc && (
-            <button onClick={reset} className="text-xs text-[#999] hover:text-[#1a1a1a] border border-[#e0ddd8] hover:border-[#ccc] rounded-full px-4 py-1.5 transition-all duration-200">
+            <button onClick={reset} className="text-xs text-[#999] hover:text-[#1a1a1a]  rounded-full px-4 py-1.5 transition-all duration-200">
               New image
             </button>
           )}
@@ -647,7 +749,7 @@ export default function Home() {
               {/* Hero text */}
               <div className="text-center pt-6 pb-6 shrink-0">
                 <h2 className="text-5xl font-light tracking-tight text-[#1a1a1a] leading-[1.1]">
-                  Find what you like.
+                  Find what you love.
                 </h2>
               </div>
 
@@ -663,39 +765,23 @@ export default function Home() {
 
               {/* Upload area */}
               <label
-                className={`shrink-0 group relative flex items-center justify-center w-full max-w-sm h-12 border border-dashed rounded-full cursor-pointer transition-all duration-300 ${
+                className={`shrink-0 group relative flex items-center justify-center w-full max-w-sm h-12 rounded-full cursor-pointer transition-all duration-300 ${
                   dragging
-                    ? "border-[#1a1a1a] bg-[#f0efe9]"
-                    : "border-[#d4d0c8] hover:border-[#aaa] hover:bg-[#f0efe9]"
+                    ? "border-[#d4d0c8] bg-[#f0efe9] border-dashed border"
+                    : "border-[#d4d0c8] hover:border-[#aaa]"
                 }`}
                 onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
                 onDragLeave={() => setDragging(false)}
                 onDrop={(e) => { setDragging(false); handleDrop(e); }}
               >
                 <span className="text-[13px] text-[#999] group-hover:text-[#666] transition-colors">
-                  or drop your own
+                  or upload your own
                 </span>
                 <input type="file" className="hidden" accept="image/*" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); }} />
               </label>
             </div>
           ) : (
             <div className="flex flex-col items-center w-full animate-fade-in-scale">
-              {/* Status */}
-              {stage === "encoding" && (
-                <div className="flex flex-col items-center gap-2 bg-white border border-[#e8e5df] rounded-xl px-5 py-3 shadow-sm min-w-[260px] mb-5">
-                  <div className="flex items-center justify-between w-full">
-                    <span className="text-sm text-[#666]">{statusText}</span>
-                    <span className="text-xs text-[#aaa] tabular-nums">{progress}%</span>
-                  </div>
-                  <div className="w-full h-1 bg-[#e8e5df] rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-[#1a1a1a] rounded-full transition-all duration-200 ease-out"
-                      style={{ width: `${progress}%` }}
-                    />
-                  </div>
-                </div>
-              )}
-
               {stage === "idle" && statusText && (
                 <div className="text-sm text-red-600 bg-red-50 border border-red-100 rounded-xl px-4 py-2.5 mb-5">{statusText}</div>
               )}
@@ -703,7 +789,79 @@ export default function Home() {
               {/* Canvas stack */}
               <div className="relative inline-block rounded-2xl overflow-hidden shadow-lg shadow-black/8 ring-1 ring-black/5">
                 <canvas ref={canvasRef} className="block" />
-                <canvas ref={dripRef} className="absolute inset-0 w-full h-full pointer-events-none transition-opacity duration-300 ease-out" style={{ zIndex: 1, opacity: 0 }} />
+
+                {/* Progress overlay */}
+                {stage === "encoding" && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-black/20 backdrop-blur-[2px]" style={{ zIndex: 30 }}>
+                    <div className="flex flex-col items-center gap-2 bg-white/90 backdrop-blur-sm rounded-xl px-5 py-3 shadow-lg min-w-[220px]">
+                      <div className="flex items-center justify-between w-full">
+                        <span className="text-sm text-[#666]">{statusText}</span>
+                        <span className="text-xs text-[#aaa] tabular-nums">{progress}%</span>
+                      </div>
+                      <div className="w-full h-1 bg-[#e8e5df] rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-[#1a1a1a] rounded-full transition-all duration-200 ease-out"
+                          style={{ width: `${progress}%` }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {/* Pinterest-style glow sweep */}
+                {dripState && (
+                  <div
+                    className="absolute inset-0 pointer-events-none"
+                    style={{
+                      zIndex: focusDimmed ? 11 : 1,
+                      opacity: dripVisible ? 1 : 0,
+                      transition: "opacity 1.5s ease, z-index 0s",
+                    }}
+                  >
+                    <style>{`
+                      @keyframes ${dripId}-sweep {
+                        0%   { -webkit-mask-position: 0 ${Math.round(-dripState.height * 0.675)}px; mask-position: 0 ${Math.round(-dripState.height * 0.675)}px; opacity: 0; }
+                        3%   { opacity: 0.5; }
+                        33%  { -webkit-mask-position: 0 ${Math.round(dripState.height * 0.675)}px; mask-position: 0 ${Math.round(dripState.height * 0.675)}px; opacity: 0.5; }
+                        34%  { -webkit-mask-position: 0 ${Math.round(dripState.height * 0.675)}px; mask-position: 0 ${Math.round(dripState.height * 0.675)}px; opacity: 0; }
+                        100% { -webkit-mask-position: 0 ${Math.round(-dripState.height * 0.675)}px; mask-position: 0 ${Math.round(-dripState.height * 0.675)}px; opacity: 0; }
+                      }
+                    `}</style>
+                    <div
+                      className="absolute inset-0"
+                      style={{
+                        maskImage: `url(${focusDimmed && focusMaskUrl ? focusMaskUrl : dripState.maskUrl})`,
+                        WebkitMaskImage: `url(${focusDimmed && focusMaskUrl ? focusMaskUrl : dripState.maskUrl})`,
+                        maskSize: "100% 100%",
+                        WebkitMaskSize: "100% 100%",
+                        transition: "mask-image 0.3s ease, -webkit-mask-image 0.3s ease",
+                      }}
+                    >
+                      <div
+                        className="absolute inset-0"
+                        style={{
+                          animation: `${dripId}-sweep 9s linear 5s infinite backwards`,
+                          maskImage: `radial-gradient(${Math.round(dripState.width * 2.5)}px ${Math.round(dripState.height * 0.35)}px, white 0%, white 15%, rgba(255,255,255,0.9) 30%, rgba(255,255,255,0.7) 45%, rgba(255,255,255,0.5) 55%, rgba(255,255,255,0.3) 65%, rgba(255,255,255,0.15) 72%, rgba(255,255,255,0.06) 80%, rgba(255,255,255,0.01) 90%, transparent 100%)`,
+                          WebkitMaskImage: `radial-gradient(${Math.round(dripState.width * 2.5)}px ${Math.round(dripState.height * 0.35)}px, white 0%, white 15%, rgba(255,255,255,0.9) 30%, rgba(255,255,255,0.7) 45%, rgba(255,255,255,0.5) 55%, rgba(255,255,255,0.3) 65%, rgba(255,255,255,0.15) 72%, rgba(255,255,255,0.06) 80%, rgba(255,255,255,0.01) 90%, transparent 100%)`,
+                          maskRepeat: "no-repeat",
+                          WebkitMaskRepeat: "no-repeat",
+                          maskSize: "100% 100%",
+                          WebkitMaskSize: "100% 100%",
+                        } as React.CSSProperties}
+                      >
+                        {/* Rainbow glow when idle, white fog when garment focused */}
+                        <div
+                          className="absolute inset-0"
+                          style={{
+                            background: focusDimmed
+                              ? "white"
+                              : "linear-gradient(135deg, #a0c4f0 0%, #c8a0e8 18%, #f0a0a0 32%, #f0c878 48%, #e0e0a0 58%, #80d8b8 72%, #a0c8e8 88%, #c8a0d8 100%)",
+                            transition: "background 0.3s ease",
+                          }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )}
                 <canvas ref={overlayARef} className="absolute inset-0 w-full h-full pointer-events-none transition-opacity duration-300 ease-out" style={{ zIndex: 11 }} />
                 <canvas ref={overlayBRef} className="absolute inset-0 w-full h-full pointer-events-none transition-opacity duration-300 ease-out" style={{ zIndex: 11 }} />
                 {/* Focus box overlay */}
@@ -762,12 +920,12 @@ export default function Home() {
             <div className="p-6 animate-fade-in">
               {/* Skeleton loading */}
               {searching && (
-                <div className="masonry-tight">
-                  {Array.from({ length: 9 }).map((_, i) => (
+                <div className="skeleton-masonry">
+                  {Array.from({ length: 12 }).map((_, i) => (
                     <div
                       key={i}
                       className="rounded-lg bg-[#EDEAE5] animate-pulse"
-                      style={{ height: [180, 240, 200, 260, 190, 230, 210, 250, 220][i] }}
+                      style={{ height: [180, 260, 200, 240, 190, 280, 220, 250, 170, 230, 260, 210][i] }}
                     />
                   ))}
                 </div>
@@ -781,26 +939,59 @@ export default function Home() {
               )}
 
               {/* Product masonry */}
-              <div className="masonry-tight stagger-children">
-                {products.filter((p) => !failedImages.has(p.image)).map((product, i) => (
-                  <div
-                    key={`${product.id}-${i}`}
-                    className="group rounded-lg overflow-hidden cursor-pointer"
-                  >
-                    {product.image && (
-                      /* eslint-disable-next-line @next/next/no-img-element */
+              {products.length > 0 && (
+                <MasonryPhotoAlbum
+                  photos={products
+                    .filter((p) => !failedImages.has(p.image) && p.image)
+                    .map((p) => ({
+                      src: p.image.startsWith("/") ? `${API_BASE}${p.image}` : p.image,
+                      width: p.width || 300,
+                      height: p.height || 400,
+                      key: `${p.id}`,
+                      title: p.name,
+                    }))}
+                  columns={(containerWidth) => {
+                    if (containerWidth < 250) return 2;
+                    if (containerWidth < 400) return 3;
+                    if (containerWidth < 600) return 4;
+                    if (containerWidth < 800) return 5;
+                    return 6;
+                  }}
+                  spacing={6}
+                  onClick={({ index }) => {
+                    const visible = products.filter((p) => !failedImages.has(p.image) && p.image);
+                    const product = visible[index];
+                    if (product) handleProductClick(product);
+                  }}
+                  render={{
+                    image: (props) => (
+                      /* eslint-disable-next-line @next/next/no-img-element, jsx-a11y/alt-text */
                       <img
-                        src={product.image.startsWith("/") ? `${API_BASE}${product.image}` : product.image}
-                        alt={product.name}
-                        className="product-img w-full h-auto block rounded-lg group-hover:brightness-[0.92] transition-[filter] duration-300"
+                        {...props}
                         loading="lazy"
+                        decoding="async"
+                        className={`${props.className || ""} product-img rounded-lg`}
                         onLoad={(e) => e.currentTarget.classList.add("loaded")}
-                        onError={() => { setFailedImages((prev) => new Set(prev).add(product.image)); }}
+                        onError={(e) => {
+                          const src = e.currentTarget.src;
+                          setFailedImages((prev) => new Set(prev).add(
+                            src.startsWith(API_BASE) ? src.slice(API_BASE.length) : src
+                          ));
+                        }}
                       />
-                    )}
-                  </div>
-                ))}
-              </div>
+                    ),
+                  }}
+                />
+              )}
+
+              {/* Infinite scroll sentinel */}
+              {hasMore && products.length > 0 && (
+                <div ref={sentinelRef} className="flex justify-center py-8">
+                  {loadingMore && (
+                    <div className="w-6 h-6 border-2 border-[#d4d0c8] border-t-[#1a1a1a] rounded-full animate-spin" />
+                  )}
+                </div>
+              )}
             </div>
           )}
         </div>

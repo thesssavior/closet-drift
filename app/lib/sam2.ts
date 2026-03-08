@@ -20,6 +20,8 @@ export interface Product {
   image: string;
   brand: string;
   link: string;
+  width: number;
+  height: number;
 }
 
 export interface SearchResult {
@@ -70,13 +72,29 @@ export async function fetchClothingMask(
 
 export async function searchProducts(
   hash: string,
-  categoryId: number
+  categoryId: number,
+  limit?: number,
+  offset?: number
 ): Promise<SearchResult> {
   const res = await fetch(`${API_BASE}/api/search`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ hash, categoryId }),
+    body: JSON.stringify({ hash, categoryId, ...(limit != null && { limit }), ...(offset != null && { offset }) }),
   });
   if (!res.ok) throw new Error(`Search failed: ${res.statusText}`);
+  return res.json();
+}
+
+export async function findSimilar(
+  pointId: number,
+  limit?: number,
+  offset?: number
+): Promise<SearchResult> {
+  const params = new URLSearchParams();
+  if (limit != null) params.set("limit", String(limit));
+  if (offset != null) params.set("offset", String(offset));
+  const qs = params.toString();
+  const res = await fetch(`${API_BASE}/api/similar/${pointId}${qs ? `?${qs}` : ""}`);
+  if (!res.ok) throw new Error(`Similar failed: ${res.statusText}`);
   return res.json();
 }

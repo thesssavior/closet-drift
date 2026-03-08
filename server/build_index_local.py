@@ -25,8 +25,8 @@ QDRANT_URL = os.environ["QDRANT_URL"]
 QDRANT_API_KEY = os.environ["QDRANT_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-COLLECTION = "fashionpedia"
-EMBED_DIM = 3072
+COLLECTION = "fashionpedia_v2"
+EMBED_DIM = 768
 BATCH_SIZE = 96
 GEMINI_EMBED_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents?key={GEMINI_API_KEY}"
 
@@ -53,7 +53,11 @@ CROPS_DIR = Path(__file__).parent / "static" / "crops"
 def embed_texts(texts: list[str]) -> list[list[float]]:
     body = {
         "requests": [
-            {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": t}]}}
+            {
+                "model": "models/gemini-embedding-001",
+                "content": {"parts": [{"text": t}]},
+                "outputDimensionality": EMBED_DIM,
+            }
             for t in texts
         ]
     }
@@ -90,12 +94,13 @@ def create_collection():
     print(f"Created collection '{COLLECTION}'")
 
 
-def crop_garment(image_path: Path, bbox: list, ann_id: int, padding: float = 0.1) -> str | None:
-    """Crop garment from image using COCO bbox [x, y, w, h] with padding. Returns crop filename."""
+def crop_garment(image_path: Path, bbox: list, ann_id: int, padding: float = 0.1) -> tuple[str, int, int] | None:
+    """Crop garment from image using COCO bbox [x, y, w, h] with padding. Returns (crop_filename, width, height)."""
     crop_filename = f"{ann_id}.jpg"
     crop_path = CROPS_DIR / crop_filename
     if crop_path.exists():
-        return crop_filename
+        with Image.open(crop_path) as existing:
+            return crop_filename, existing.size[0], existing.size[1]
 
     try:
         img = Image.open(image_path)
@@ -124,7 +129,7 @@ def crop_garment(image_path: Path, bbox: list, ann_id: int, padding: float = 0.1
         crop = crop.resize((int(crop.size[0] * scale), int(crop.size[1] * scale)), Image.LANCZOS)
 
     crop.save(crop_path, "JPEG", quality=85)
-    return crop_filename
+    return crop_filename, crop.size[0], crop.size[1]
 
 
 def build_items(annotations_path: str) -> list[dict]:
@@ -159,10 +164,12 @@ def build_items(annotations_path: str) -> list[dict]:
             skipped += 1
             continue
 
-        crop_filename = crop_garment(img_path, bbox, ann["id"])
-        if not crop_filename:
+        crop_result = crop_garment(img_path, bbox, ann["id"])
+        if not crop_result:
             skipped += 1
             continue
+
+        crop_filename, crop_w, crop_h = crop_result
 
         cat_name = categories.get(cat_id, "clothing")
         attr_ids = ann.get("attribute_ids", [])
@@ -182,6 +189,8 @@ def build_items(annotations_path: str) -> list[dict]:
             "category_id": cat_id,
             "attributes": attr_names,
             "crop_filename": crop_filename,
+            "width": crop_w,
+            "height": crop_h,
         })
 
     print(f"Built {len(items)} items ({skipped} skipped)")
@@ -235,6 +244,8 @@ def main():
                     "category_id": item["category_id"],
                     "attributes": item["attributes"],
                     "crop_filename": item["crop_filename"],
+                    "width": item["width"],
+                    "height": item["height"],
                 },
             })
 

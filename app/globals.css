@@ -103,33 +103,6 @@ body {
   background: #a3a3a3;
 }
 
-/* Masonry layout — tight (search panel), responsive to panel width */
-.masonry-tight {
-  columns: 1;
-  column-gap: 6px;
-}
-.masonry-tight > * {
-  break-inside: avoid;
-  margin-bottom: 6px;
-  display: inline-block;
-  width: 100%;
-}
-@container (min-width: 250px) {
-  .masonry-tight { columns: 2; }
-}
-@container (min-width: 400px) {
-  .masonry-tight { columns: 3; }
-}
-@container (min-width: 600px) {
-  .masonry-tight { columns: 4; }
-}
-@container (min-width: 800px) {
-  .masonry-tight { columns: 5; }
-}
-@container (min-width: 1000px) {
-  .masonry-tight { columns: 6; }
-}
-
 /* Sample grid hover */
 .react-photo-album--button {
   border-radius: 12px !important;
@@ -146,6 +119,33 @@ body {
 }
 .react-photo-album--button:hover .react-photo-album--image {
   filter: brightness(0.88);
+}
+
+/* Skeleton masonry — matches product grid columns */
+.skeleton-masonry {
+  columns: 2;
+  column-gap: 6px;
+}
+.skeleton-masonry > * {
+  break-inside: avoid;
+  margin-bottom: 6px;
+  display: inline-block;
+  width: 100%;
+}
+@container (min-width: 250px) {
+  .skeleton-masonry { columns: 2; }
+}
+@container (min-width: 400px) {
+  .skeleton-masonry { columns: 3; }
+}
+@container (min-width: 600px) {
+  .skeleton-masonry { columns: 4; }
+}
+@container (min-width: 800px) {
+  .skeleton-masonry { columns: 5; }
+}
+@container (min-width: 1000px) {
+  .skeleton-masonry { columns: 6; }
 }
 
 /* Product card image reveal */

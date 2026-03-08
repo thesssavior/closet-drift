@@ -16,12 +16,13 @@ import requests as http_requests
 from transformers import SegformerImageProcessor
 from optimum.onnxruntime import ORTModelForSemanticSegmentation
 from scipy.ndimage import zoom
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageFilter
 from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, MatchAny
 
 app = FastAPI()
 app.add_middleware(
@@ -40,7 +41,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_EMBED_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={GEMINI_API_KEY}"
 
 qdrant: QdrantClient | None = None
-QDRANT_COLLECTION = "fashionpedia"
+QDRANT_COLLECTION = "fashionpedia_v2"
 
 LABELS = {
     0: "Background",
@@ -79,6 +80,20 @@ SEARCH_NAMES = {
 }
 
 CLOTHING_IDS = {1, 3, 4, 5, 6, 7, 8, 9, 10, 16, 17}
+
+# SegFormer label IDs → Fashionpedia category IDs for filtering
+SEGFORMER_TO_FASHIONPEDIA = {
+    4: [0, 1, 2, 3, 4, 5],   # Upper-clothes → shirt/top/sweater/cardigan/jacket/vest
+    5: [8],                    # Skirt
+    6: [6, 7],                 # Pants → pants/shorts
+    7: [10, 11],               # Dress → dress/jumpsuit
+    1: [14],                   # Hat
+    3: [13],                   # Sunglasses
+    8: [19],                   # Belt
+    9: [23], 10: [23],         # Left/Right-shoe → shoe
+    16: [24],                  # Bag
+    17: [25],                  # Scarf
+}
 
 processor = None
 model = None
@@ -149,43 +164,57 @@ def dominant_color_name(img: Image.Image, mask: np.ndarray) -> str:
     return "pink"
 
 
-def embed_query(text: str) -> list[float]:
+def embed_query(text: str, output_dimensionality: int | None = None) -> list[float]:
     """Embed a single query using Gemini."""
-    resp = http_requests.post(
-        GEMINI_EMBED_URL,
-        json={"model": "models/gemini-embedding-001", "content": {"parts": [{"text": text}]}},
-        timeout=10,
-    )
+    body: dict = {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": text}]}}
+    if output_dimensionality:
+        body["outputDimensionality"] = output_dimensionality
+    resp = http_requests.post(GEMINI_EMBED_URL, json=body, timeout=10)
     resp.raise_for_status()
     return resp.json()["embedding"]["values"]
 
 
-def search_qdrant(query: str, limit: int = 16) -> list[dict]:
+def _point_to_product(point) -> dict:
+    p = point.payload
+    crop = p.get("crop_filename", "")
+    image_url = f"/crops/{crop}" if crop else ""
+    return {
+        "id": point.id,
+        "name": p.get("description", ""),
+        "price": "",
+        "image": image_url,
+        "brand": ", ".join(p.get("attributes", [])[:3]),
+        "link": "",
+        "width": p.get("width", 0),
+        "height": p.get("height", 0),
+    }
+
+
+def search_qdrant(
+    query: str,
+    limit: int = 100,
+    offset: int = 0,
+    category_ids: list[int] | None = None,
+) -> list[dict]:
     """Vector search on Qdrant using Gemini embeddings."""
     if not qdrant or not GEMINI_API_KEY:
         return []
 
     try:
-        vector = embed_query(query)
+        vector = embed_query(query, output_dimensionality=768)
+        query_filter = None
+        if category_ids:
+            query_filter = Filter(
+                must=[FieldCondition(key="category_id", match=MatchAny(any=category_ids))]
+            )
         results = qdrant.query_points(
             collection_name=QDRANT_COLLECTION,
             query=vector,
             limit=limit,
+            offset=offset,
+            query_filter=query_filter,
         )
-        items = []
-        for point in results.points:
-            p = point.payload
-            crop = p.get("crop_filename", "")
-            image_url = f"/crops/{crop}" if crop else ""
-            items.append({
-                "id": point.id,
-                "name": p.get("description", ""),
-                "price": "",
-                "image": image_url,
-                "brand": ", ".join(p.get("attributes", [])[:3]),
-                "link": "",
-            })
-        return items
+        return [_point_to_product(point) for point in results.points]
     except Exception as e:
         print(f"[search] error: {e}")
         return []
@@ -201,6 +230,16 @@ async def startup():
     if qdrant_url and qdrant_key:
         qdrant = QdrantClient(url=qdrant_url, api_key=qdrant_key)
         print(f"Connected to Qdrant at {qdrant_url}")
+        # Ensure payload index exists for category filtering
+        try:
+            qdrant.create_payload_index(
+                collection_name=QDRANT_COLLECTION,
+                field_name="category_id",
+                field_schema="integer",
+            )
+            print("Created payload index on category_id")
+        except Exception:
+            pass  # Already exists
     else:
         print("WARNING: QDRANT_URL / QDRANT_API_KEY not set, search disabled")
 
@@ -305,6 +344,8 @@ async def search_item(body: dict):
     """Search for similar products based on clicked clothing item."""
     h = body["hash"]
     category_id = int(body["categoryId"])
+    limit = int(body.get("limit", 100))
+    offset = int(body.get("offset", 0))
 
     if h not in seg_cache:
         return JSONResponse({"error": "Image not encoded"}, 400)
@@ -318,14 +359,41 @@ async def search_item(body: dict):
     search_term = SEARCH_NAMES.get(category_id, LABELS.get(category_id, "clothing"))
     query = f"{color} {search_term}".strip()
 
-    print(f"[search] category={LABELS[category_id]} color={color} query=\"{query}\"")
+    # Map SegFormer category to Fashionpedia categories for filtering
+    fashionpedia_ids = SEGFORMER_TO_FASHIONPEDIA.get(category_id)
 
-    products = search_qdrant(query)
+    print(f"[search] category={LABELS[category_id]} color={color} query=\"{query}\" filter={fashionpedia_ids}")
+
+    products = search_qdrant(query, limit=limit, offset=offset, category_ids=fashionpedia_ids)
 
     return {
         "query": query,
         "products": products,
     }
+
+
+@app.get("/api/similar/{point_id}")
+async def find_similar(
+    point_id: int,
+    limit: int = Query(default=100),
+    offset: int = Query(default=0),
+):
+    """Find similar products by Qdrant point ID."""
+    if not qdrant:
+        return JSONResponse({"error": "Search not available"}, 503)
+
+    try:
+        results = qdrant.query_points(
+            collection_name=QDRANT_COLLECTION,
+            query=point_id,
+            limit=limit,
+            offset=offset,
+        )
+        products = [_point_to_product(point) for point in results.points]
+        return {"query": f"similar to #{point_id}", "products": products}
+    except Exception as e:
+        print(f"[similar] error: {e}")
+        return JSONResponse({"error": str(e)}, 500)
 
 
 @app.post("/api/clothing-mask")
