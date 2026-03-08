@@ -10,6 +10,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
+COPY static/ static/
 
 # Pre-download and export ONNX model at build time
 RUN python -c "from transformers import SegformerImageProcessor; \

@@ -790,23 +790,7 @@ function Home() {
               <div className="relative inline-block rounded-2xl overflow-hidden shadow-lg shadow-black/8 ring-1 ring-black/5">
                 <canvas ref={canvasRef} className="block" />
 
-                {/* Progress overlay */}
-                {stage === "encoding" && (
-                  <div className="absolute inset-0 flex items-center justify-center bg-black/20 backdrop-blur-[2px]" style={{ zIndex: 30 }}>
-                    <div className="flex flex-col items-center gap-2 bg-white/90 backdrop-blur-sm rounded-xl px-5 py-3 shadow-lg min-w-[220px]">
-                      <div className="flex items-center justify-between w-full">
-                        <span className="text-sm text-[#666]">{statusText}</span>
-                        <span className="text-xs text-[#aaa] tabular-nums">{progress}%</span>
-                      </div>
-                      <div className="w-full h-1 bg-[#e8e5df] rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-[#1a1a1a] rounded-full transition-all duration-200 ease-out"
-                          style={{ width: `${progress}%` }}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                )}
+                {/* Progress overlay removed — analyzing message now below image */}
                 {/* Pinterest-style glow sweep */}
                 {dripState && (
                   <div
@@ -905,6 +889,22 @@ function Home() {
                   onClick={handleClick}
                 />
               </div>
+
+              {/* Analyzing message below the image */}
+              {stage === "encoding" && (
+                <div className="flex flex-col items-center gap-2 mt-4 w-full max-w-[320px] mx-auto">
+                  <div className="flex items-center justify-between w-full">
+                    <span className="text-sm text-[#666]">{statusText}</span>
+                    <span className="text-xs text-[#aaa] tabular-nums">{progress}%</span>
+                  </div>
+                  <div className="w-full h-1 bg-[#e8e5df] rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-[#1a1a1a] rounded-full transition-all duration-200 ease-out"
+                      style={{ width: `${progress}%` }}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>
