@@ -871,7 +871,7 @@ function Home() {
                           style={{
                             background: focusDimmed
                               ? "white"
-                              : "linear-gradient(135deg, #a0c4f0 0%, #c8a0e8 18%, #f0a0a0 32%, #f0c878 48%, #e0e0a0 58%, #80d8b8 72%, #a0c8e8 88%, #c8a0d8 100%)",
+                              : "linear-gradient(180deg, #8070d0 0%, #a078e0 15%, #d070a0 30%, #f0a0a0 45%, #f0c878 60%, #e0e0a0 72%, #80d8b8 85%, #70c0a0 100%)",
                             transition: "background 0.3s ease",
                           }}
                         />
