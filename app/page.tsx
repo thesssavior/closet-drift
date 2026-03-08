@@ -142,6 +142,8 @@ function Home() {
     const observer = new ResizeObserver(() => {
       const img = imageRef.current;
       if (!img) return;
+      // Skip canvas redraw if a garment is selected (panel is open) to avoid second jump
+      if (focusDimmedRef.current) return;
       drawImage(img);
       // Clear stale overlays and focus box
       for (const ref of [overlayARef, overlayBRef]) {
@@ -780,7 +782,7 @@ function Home() {
       {/* Main content */}
       <div className="relative z-10 flex flex-col lg:flex-row" style={{ height: "calc(100vh - 65px)" }}>
         {/* Left: Image */}
-        <div ref={containerRef} className={`flex-1 min-w-0 flex flex-col items-center overflow-auto ${imageSrc ? "justify-start p-6" : "justify-center p-6"}`}>
+        <div ref={containerRef} className={`flex-1 min-w-0 flex flex-col items-center overflow-auto ${imageSrc ? "lg:flex-none lg:w-[50vw] justify-start p-6" : "justify-center p-6"}`}>
           {!imageSrc ? (
             <div key={landingKey} className="flex flex-col items-center w-full max-w-3xl animate-fade-in" ref={(el) => { if (el) console.log("[landing] wrapper mounted, offsetWidth:", el.offsetWidth, "offsetHeight:", el.offsetHeight); }}>
               {/* Hero text */}
