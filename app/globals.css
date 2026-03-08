@@ -1,8 +1,8 @@
 @import "tailwindcss";
 
 :root {
-  --background: #09090b;
-  --foreground: #fafafa;
+  --background: #F8F7F4;
+  --foreground: #1a1a1a;
 }
 
 @theme inline {
@@ -16,17 +16,6 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-sans), system-ui, -apple-system, sans-serif;
-}
-
-/* Subtle noise texture */
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  opacity: 0.015;
-  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-  pointer-events: none;
-  z-index: 50;
 }
 
 /* Fade-in animation */
@@ -99,7 +88,7 @@ body::before {
 .stagger-children > *:nth-child(7) { animation-delay: 0.21s; }
 .stagger-children > *:nth-child(8) { animation-delay: 0.24s; }
 
-/* Scrollbar */
+/* Scrollbar - light theme */
 ::-webkit-scrollbar {
   width: 6px;
 }
@@ -107,9 +96,63 @@ body::before {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #27272a;
+  background: #d4d4d4;
   border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #3f3f46;
+  background: #a3a3a3;
+}
+
+/* Masonry layout — tight (search panel), responsive to panel width */
+.masonry-tight {
+  columns: 1;
+  column-gap: 6px;
+}
+.masonry-tight > * {
+  break-inside: avoid;
+  margin-bottom: 6px;
+  display: inline-block;
+  width: 100%;
+}
+@container (min-width: 250px) {
+  .masonry-tight { columns: 2; }
+}
+@container (min-width: 400px) {
+  .masonry-tight { columns: 3; }
+}
+@container (min-width: 600px) {
+  .masonry-tight { columns: 4; }
+}
+@container (min-width: 800px) {
+  .masonry-tight { columns: 5; }
+}
+@container (min-width: 1000px) {
+  .masonry-tight { columns: 6; }
+}
+
+/* Sample grid hover */
+.react-photo-album--button {
+  border-radius: 12px !important;
+  overflow: hidden;
+  transition: box-shadow 0.3s ease;
+  transform: none !important;
+}
+.react-photo-album--button:hover {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+.react-photo-album--image {
+  border-radius: 12px;
+  transition: filter 0.3s ease;
+}
+.react-photo-album--button:hover .react-photo-album--image {
+  filter: brightness(0.88);
+}
+
+/* Product card image reveal */
+.product-img {
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+.product-img.loaded {
+  opacity: 1;
 }

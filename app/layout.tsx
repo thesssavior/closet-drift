@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Fit Detector",
-  description: "AI-powered outfit detection — hover to highlight, click to search",
+  title: "Closet Drift",
+  description: "See something you like? Find it.",
 };
 
 export default function RootLayout({

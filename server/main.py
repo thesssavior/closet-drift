@@ -19,6 +19,7 @@ from scipy.ndimage import zoom
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageFilter
 from qdrant_client import QdrantClient
 
@@ -30,14 +31,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Serve cropped garment images
+_static_dir = Path(__file__).parent / "static" / "crops"
+if _static_dir.exists():
+    app.mount("/crops", StaticFiles(directory=str(_static_dir)), name="crops")
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_EMBED_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={GEMINI_API_KEY}"
 
 qdrant: QdrantClient | None = None
 QDRANT_COLLECTION = "fashionpedia"
-
-# Map S3 filenames -> Flickr original URLs (S3 bucket is access-restricted)
-_flickr_url_map: dict[str, str] = {}
 
 LABELS = {
     0: "Background",
@@ -146,14 +149,6 @@ def dominant_color_name(img: Image.Image, mask: np.ndarray) -> str:
     return "pink"
 
 
-def _resolve_image_url(url: str) -> str:
-    """Convert S3 URL to Flickr original URL."""
-    if not url or not _flickr_url_map:
-        return url
-    filename = url.split("/")[-1]
-    return _flickr_url_map.get(filename, url)
-
-
 def embed_query(text: str) -> list[float]:
     """Embed a single query using Gemini."""
     resp = http_requests.post(
@@ -180,11 +175,13 @@ def search_qdrant(query: str, limit: int = 16) -> list[dict]:
         items = []
         for point in results.points:
             p = point.payload
+            crop = p.get("crop_filename", "")
+            image_url = f"/crops/{crop}" if crop else ""
             items.append({
                 "id": point.id,
                 "name": p.get("description", ""),
                 "price": "",
-                "image": _resolve_image_url(p.get("image_url", "")),
+                "image": image_url,
                 "brand": ", ".join(p.get("attributes", [])[:3]),
                 "link": "",
             })
@@ -207,15 +204,6 @@ async def startup():
     else:
         print("WARNING: QDRANT_URL / QDRANT_API_KEY not set, search disabled")
 
-    # Load Flickr URL map
-    import json
-    ann_path = Path(__file__).parent / "data" / "fashionpedia_train.json"
-    if ann_path.exists():
-        with open(ann_path) as f:
-            ann = json.load(f)
-        for img in ann["images"]:
-            _flickr_url_map[img["file_name"]] = img.get("original_url", "")
-        print(f"Loaded {len(_flickr_url_map)} Flickr URL mappings")
 
 
 @app.post("/api/encode")

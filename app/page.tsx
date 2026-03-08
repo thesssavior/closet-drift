@@ -1,15 +1,27 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
+import { MasonryPhotoAlbum } from "react-photo-album";
+import "react-photo-album/masonry.css";
 import {
   encodeImage,
   decodeMask,
   searchProducts,
   fetchClothingMask,
+  API_BASE,
   type Product,
 } from "./lib/sam2";
 
 type Stage = "idle" | "encoding" | "ready";
+
+const SAMPLE_PHOTOS = [
+  { src: "/samples/1.jpeg", width: 736, height: 1104 },
+  { src: "/samples/2.jpg", width: 1707, height: 2560 },
+  { src: "/samples/3.jpg", width: 540, height: 360 },
+  { src: "/samples/4.jpg", width: 1110, height: 1665 },
+  { src: "/samples/5.jpg", width: 1024, height: 683 },
+  { src: "/samples/6.jpg", width: 1920, height: 1280 },
+];
 
 function computeBboxFromMask(maskData: ImageData, padding = 16) {
   const { width, height, data } = maskData;
@@ -38,6 +50,7 @@ export default function Home() {
   const [stage, setStage] = useState<Stage>("idle");
   const [statusText, setStatusText] = useState("");
   const [imageSrc, setImageSrc] = useState<string | null>(null);
+  const [landingKey, setLandingKey] = useState(0);
   const [products, setProducts] = useState<Product[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [searching, setSearching] = useState(false);
@@ -70,7 +83,8 @@ export default function Home() {
   const startDripRef = useRef<((maskB64: string) => void) | null>(null);
 
   const drawImage = useCallback((img: HTMLImageElement) => {
-    const canvas = canvasRef.current!;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
     const ctx = canvas.getContext("2d")!;
 
     const container = containerRef.current ?? canvas.parentElement!;
@@ -89,6 +103,28 @@ export default function Home() {
     dimsRef.current = { scale, origW: img.naturalWidth, origH: img.naturalHeight };
   }, []);
 
+  // Redraw canvas when container resizes (e.g. panel open/close)
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const observer = new ResizeObserver(() => {
+      const img = imageRef.current;
+      if (!img) return;
+      drawImage(img);
+      // Clear stale overlays and focus box
+      for (const ref of [overlayARef, overlayBRef]) {
+        if (ref.current) {
+          ref.current.style.opacity = "0";
+          const ctx = ref.current.getContext("2d");
+          if (ctx) ctx.clearRect(0, 0, ref.current.width, ref.current.height);
+        }
+      }
+      lastCategoryRef.current = -1;
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [drawImage]);
+
   const canvasToModelCoords = useCallback(
     (canvasX: number, canvasY: number) => {
       const { scale, origW, origH } = dimsRef.current;
@@ -101,9 +137,8 @@ export default function Home() {
     []
   );
 
-  const handleFile = useCallback(
-    async (file: File) => {
-      const url = URL.createObjectURL(file);
+  const processImage = useCallback(
+    async (file: File, url: string) => {
       setImageSrc(url);
       setProducts([]); setFailedImages(new Set());
       setSearchQuery("");
@@ -136,7 +171,6 @@ export default function Home() {
           setStage("ready");
           setStatusText("Hover to detect — click to search");
 
-          // Start drip animation on clothing segments
           const canvas = canvasRef.current;
           if (canvas) {
             fetchClothingMask(result.hash, canvas.width, canvas.height)
@@ -154,6 +188,27 @@ export default function Home() {
     [drawImage]
   );
 
+  const handleFile = useCallback(
+    async (file: File) => {
+      const url = URL.createObjectURL(file);
+      processImage(file, url);
+    },
+    [processImage]
+  );
+
+  const handleSampleClick = useCallback(
+    async (src: string) => {
+      try {
+        const res = await fetch(src);
+        const blob = await res.blob();
+        const file = new File([blob], src.split("/").pop() || "sample.jpg", { type: blob.type });
+        processImage(file, src);
+      } catch (err: any) {
+        setStatusText(`Error loading sample: ${err.message}`);
+      }
+    },
+    [processImage]
+  );
 
   // --- Mask rendering ---
   const getOverlayRefs = useCallback(() => {
@@ -183,7 +238,6 @@ export default function Home() {
 
         const focused = focusDimmedRef.current;
         if (focused) {
-          // Build alpha mask from the R channel, then composite original image through it
           const alphaMask = ctx.createImageData(newCanvas.width, newCanvas.height);
           for (let i = 0; i < maskData.data.length; i += 4) {
             const v = maskData.data[i];
@@ -199,16 +253,23 @@ export default function Home() {
           ctx.drawImage(canvasRef.current!, 0, 0);
           ctx.globalCompositeOperation = "source-over";
         } else {
+          // Per-pixel adaptive brightening: bright areas get more, shadows stay natural
+          const srcCtx = canvasRef.current!.getContext("2d")!;
+          const srcData = srcCtx.getImageData(0, 0, newCanvas.width, newCanvas.height);
+
           const out = ctx.createImageData(newCanvas.width, newCanvas.height);
           for (let i = 0; i < maskData.data.length; i += 4) {
             const a = maskData.data[i];
             if (a > 20) {
               const n = Math.min(a / 255, 1);
               const soft = n * n * n * n;
+              const lum = (srcData.data[i] * 0.299 + srcData.data[i + 1] * 0.587 + srcData.data[i + 2] * 0.114) / 255;
+              // Shadows (~0): ~2%, midtones: ~5%, highlights (~1): ~10%
+              const strength = 0.02 + lum * lum * 0.3;
               out.data[i] = 255;
-              out.data[i + 1] = 245;
-              out.data[i + 2] = 235;
-              out.data[i + 3] = Math.floor(soft * 0.03 * 255);
+              out.data[i + 1] = 255;
+              out.data[i + 2] = 255;
+              out.data[i + 3] = Math.floor(soft * strength * 255);
             }
           }
           ctx.putImageData(out, 0, 0);
@@ -250,7 +311,6 @@ export default function Home() {
       const w = drip.width;
       const h = drip.height;
 
-      // Build clothing mask canvas (R channel → alpha)
       const maskCanvas = document.createElement("canvas");
       maskCanvas.width = w;
       maskCanvas.height = h;
@@ -267,21 +327,19 @@ export default function Home() {
       maskCtx.putImageData(raw, 0, 0);
       dripMaskCanvasRef.current = maskCanvas;
 
-      // Pre-render static rainbow gradient (purple/blue top-left → yellow/red bottom-right)
       const gradCanvas = document.createElement("canvas");
       gradCanvas.width = w;
       gradCanvas.height = h;
       const gradCtx = gradCanvas.getContext("2d")!;
       const baseGrad = gradCtx.createLinearGradient(0, 0, w, h);
-      baseGrad.addColorStop(0, "rgba(120, 60, 255, 0.35)");
-      baseGrad.addColorStop(0.2, "rgba(80, 120, 255, 0.32)");
-      baseGrad.addColorStop(0.4, "rgba(60, 200, 220, 0.28)");
-      baseGrad.addColorStop(0.6, "rgba(80, 220, 120, 0.26)");
-      baseGrad.addColorStop(0.8, "rgba(255, 200, 60, 0.28)");
-      baseGrad.addColorStop(1, "rgba(255, 80, 80, 0.35)");
+      baseGrad.addColorStop(0, "rgba(120, 60, 255, 0.25)");
+      baseGrad.addColorStop(0.2, "rgba(80, 120, 255, 0.22)");
+      baseGrad.addColorStop(0.4, "rgba(60, 200, 220, 0.18)");
+      baseGrad.addColorStop(0.6, "rgba(80, 220, 120, 0.16)");
+      baseGrad.addColorStop(0.8, "rgba(255, 200, 60, 0.18)");
+      baseGrad.addColorStop(1, "rgba(255, 80, 80, 0.25)");
       gradCtx.fillStyle = baseGrad;
       gradCtx.fillRect(0, 0, w, h);
-      // Clip gradient to clothing mask
       gradCtx.globalCompositeOperation = "destination-in";
       gradCtx.drawImage(maskCanvas, 0, 0);
       gradCtx.globalCompositeOperation = "source-over";
@@ -290,26 +348,33 @@ export default function Home() {
       const ctx = drip.getContext("2d")!;
       const radius = Math.max(w, h) * 0.9;
       let start: number | null = null;
-      const duration = 6000;
+      const sweepDuration = 6000;
+      const pauseDuration = 10000;
+      const cycleDuration = sweepDuration + pauseDuration;
 
-      // Pre-render the soft blob onto an offscreen canvas to avoid radial gradient artifacts
       const blobCanvas = document.createElement("canvas");
       blobCanvas.width = w;
       blobCanvas.height = h;
 
       const animate = (ts: number) => {
         if (!start) start = ts;
-        const raw = ((ts - start) % duration) / duration;
+        const elapsed = ((ts - start) % cycleDuration);
+
+        if (elapsed >= sweepDuration) {
+          ctx.clearRect(0, 0, w, h);
+          dripRafRef.current = requestAnimationFrame(animate);
+          return;
+        }
+
+        const raw = elapsed / sweepDuration;
         const t = raw < 0.5
           ? 2 * raw * raw
           : 1 - 2 * (1 - raw) * (1 - raw);
         const cx = -radius * 0.2 + (w + radius * 0.4) * t;
         const cy = -radius * 0.2 + (h + radius * 0.4) * t;
-        // Smooth fade at cycle boundaries
         const edgeFade = Math.min(raw / 0.2, 1) * Math.min((1 - raw) / 0.2, 1);
-        const smoothFade = edgeFade * edgeFade * (3 - 2 * edgeFade); // smoothstep
+        const smoothFade = edgeFade * edgeFade * (3 - 2 * edgeFade);
 
-        // Draw blob to offscreen
         const bCtx = blobCanvas.getContext("2d")!;
         bCtx.clearRect(0, 0, w, h);
         const fog = bCtx.createRadialGradient(cx, cy, 0, cx, cy, radius);
@@ -361,7 +426,6 @@ export default function Home() {
     setFocusDimmed(false);
     focusDimmedRef.current = false;
     setTimeout(() => setFocusBox(null), 400);
-    // Restart drip
     if (hashRef.current && canvas) {
       fetchClothingMask(hashRef.current, canvas.width, canvas.height)
         .then((r) => { if (r.mask) startDrip(r.mask); })
@@ -374,7 +438,6 @@ export default function Home() {
     lastCategoryRef.current = -1;
   }, [clearOverlay]);
 
-  // --- Hover / Click ---
   const handleHover = useCallback(
     async (e: React.MouseEvent<HTMLElement>) => {
       if (stage !== "ready" || !hashRef.current) return;
@@ -386,7 +449,6 @@ export default function Home() {
       const cx = e.clientX - rect.left;
       const cy = e.clientY - rect.top;
 
-      // If focused and cursor is inside the focus box, do nothing
       if (focusDimmedRef.current && focusBox) {
         if (cx >= focusBox.x && cx <= focusBox.x + focusBox.w &&
             cy >= focusBox.y && cy <= focusBox.y + focusBox.h) {
@@ -420,7 +482,6 @@ export default function Home() {
 
   const animateFocusBox = useCallback((bbox: { x: number; y: number; w: number; h: number }) => {
     const canvas = canvasRef.current!;
-    // Clamp box within canvas bounds with inset so corners don't touch edges
     const inset = 14;
     const maxW = Math.min(bbox.w, canvas.width - inset * 2);
     const maxH = Math.min(bbox.h, canvas.height - inset * 2);
@@ -467,7 +528,6 @@ export default function Home() {
       const canvasX = e.clientX - rect.left;
       const canvasY = e.clientY - rect.top;
 
-      // Click inside the focus box → dismiss it
       if (focusDimmedRef.current && focusBox) {
         if (canvasX >= focusBox.x && canvasX <= focusBox.x + focusBox.w &&
             canvasY >= focusBox.y && canvasY <= focusBox.y + focusBox.h) {
@@ -493,7 +553,7 @@ export default function Home() {
       setSearchQuery("");
 
       decodeMask(hash, x, y, canvas.width, canvas.height).then((result) => {
-        if (clickGenRef.current !== gen) return; // stale click, discard
+        if (clickGenRef.current !== gen) return;
 
         if (result.mask) {
           decodeMaskToBbox(result.mask, canvas.width, canvas.height).then((bbox) => {
@@ -536,6 +596,7 @@ export default function Home() {
   );
 
   const reset = () => {
+    console.log("[reset] called, current imageSrc:", imageSrc);
     stopDrip();
     setImageSrc(null);
     setStage("idle");
@@ -547,6 +608,7 @@ export default function Home() {
     setFocusDimmed(false);
     focusDimmedRef.current = false;
     hashRef.current = "";
+    setLandingKey((k) => k + 1);
   };
 
   const closePanel = useCallback(() => {
@@ -559,30 +621,17 @@ export default function Home() {
   }, [dismissFocus, clearOverlay]);
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 relative overflow-hidden">
-      {/* Ambient blobs */}
-      <div className="fixed inset-0 pointer-events-none overflow-hidden">
-        <div className="absolute -top-60 -left-60 w-[500px] h-[500px] bg-purple-600/[0.04] rounded-full blur-[120px]" />
-        <div className="absolute -bottom-60 -right-60 w-[500px] h-[500px] bg-blue-600/[0.04] rounded-full blur-[120px]" />
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] bg-indigo-500/[0.02] rounded-full blur-[150px]" />
-      </div>
-
+    <div className="min-h-screen bg-[#F8F7F4] text-[#1a1a1a] relative">
       {/* Header */}
-      <header className="relative z-10 border-b border-white/[0.06] px-6 py-4 backdrop-blur-xl bg-zinc-950/70">
+      <header className="relative z-10 px-6 py-5">
         <div className="max-w-7xl mx-auto flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg flex items-center justify-center">
-              <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
-              </svg>
-            </div>
-            <div>
-              <h1 className="text-[15px] font-semibold tracking-tight text-white">Fit Detector</h1>
-              <p className="text-[11px] text-zinc-500">AI-powered outfit recognition</p>
-            </div>
-          </div>
+          <button onClick={imageSrc ? reset : undefined} className="group">
+            <h1 className="text-[17px] font-medium tracking-tight text-[#1a1a1a]">
+              Closet Drift
+            </h1>
+          </button>
           {imageSrc && (
-            <button onClick={reset} className="text-xs text-zinc-500 hover:text-zinc-200 border border-white/[0.08] hover:border-white/[0.15] hover:bg-white/[0.04] rounded-lg px-3 py-1.5 transition-all duration-200">
+            <button onClick={reset} className="text-xs text-[#999] hover:text-[#1a1a1a] border border-[#e0ddd8] hover:border-[#ccc] rounded-full px-4 py-1.5 transition-all duration-200">
               New image
             </button>
           )}
@@ -590,81 +639,69 @@ export default function Home() {
       </header>
 
       {/* Main content */}
-      <div className="relative z-10 flex flex-col lg:flex-row h-[calc(100vh-57px)]">
+      <div className="relative z-10 flex flex-col lg:flex-row" style={{ height: "calc(100vh - 65px)" }}>
         {/* Left: Image */}
-        <div ref={containerRef} className="flex-1 flex flex-col items-center justify-center p-6 overflow-auto">
+        <div ref={containerRef} className={`flex-1 min-w-0 flex flex-col items-center overflow-auto ${imageSrc ? "justify-start p-6" : "justify-center p-6"}`}>
           {!imageSrc ? (
-            <div className="flex flex-col items-center gap-10 w-full max-w-md animate-fade-in">
-              <div className="text-center space-y-3">
-                <h2 className="text-4xl font-bold tracking-tight bg-gradient-to-b from-white via-zinc-200 to-zinc-500 bg-clip-text text-transparent leading-tight">
-                  Detect any outfit
+            <div key={landingKey} className="flex flex-col items-center w-full max-w-3xl animate-fade-in" ref={(el) => { if (el) console.log("[landing] wrapper mounted, offsetWidth:", el.offsetWidth, "offsetHeight:", el.offsetHeight); }}>
+              {/* Hero text */}
+              <div className="text-center pt-6 pb-6 shrink-0">
+                <h2 className="text-5xl font-light tracking-tight text-[#1a1a1a] leading-[1.1]">
+                  Find what you like.
                 </h2>
-                <p className="text-zinc-500 text-[13px] max-w-xs mx-auto leading-relaxed">
-                  Upload a photo and AI identifies each clothing item. Click any piece to find it online.
-                </p>
               </div>
 
+              {/* Sample images — masonry */}
+              <div className="w-full py-8" ref={(el) => { if (el) console.log("[gallery] container mounted, offsetWidth:", el.offsetWidth, "offsetHeight:", el.offsetHeight, "children:", el.children.length, "innerHTML length:", el.innerHTML.length); }}>
+                <MasonryPhotoAlbum
+                  photos={SAMPLE_PHOTOS}
+                  columns={3}
+                  spacing={8}
+                  onClick={({ photo }) => handleSampleClick(photo.src)}
+                />
+              </div>
+
+              {/* Upload area */}
               <label
-                className={`group relative flex flex-col items-center justify-center w-full h-72 border border-white/[0.06] rounded-2xl cursor-pointer hover:border-white/[0.12] bg-white/[0.02] hover:bg-white/[0.04] transition-all duration-500 ${dragging ? "border-white/[0.12] bg-white/[0.04]" : ""}`}
+                className={`shrink-0 group relative flex items-center justify-center w-full max-w-sm h-12 border border-dashed rounded-full cursor-pointer transition-all duration-300 ${
+                  dragging
+                    ? "border-[#1a1a1a] bg-[#f0efe9]"
+                    : "border-[#d4d0c8] hover:border-[#aaa] hover:bg-[#f0efe9]"
+                }`}
                 onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
                 onDragLeave={() => setDragging(false)}
                 onDrop={(e) => { setDragging(false); handleDrop(e); }}
               >
-                <div className={`absolute inset-[-1px] rounded-2xl bg-gradient-to-br from-purple-500/0 via-transparent to-blue-500/0 group-hover:from-purple-500/20 group-hover:to-blue-500/20 transition-all duration-700 pointer-events-none ${dragging ? "from-purple-500/20 to-blue-500/20" : ""}`} />
-
-                <div className="relative flex flex-col items-center gap-5">
-                  <div className={`w-14 h-14 rounded-xl bg-white/[0.04] group-hover:bg-white/[0.08] border border-white/[0.06] flex items-center justify-center transition-all duration-300 group-hover:scale-105 ${dragging ? "bg-white/[0.08] scale-105" : ""}`}>
-                    <svg className={`w-6 h-6 text-zinc-500 group-hover:text-zinc-300 transition-colors duration-300 ${dragging ? "text-zinc-300" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
-                    </svg>
-                  </div>
-                  <div className="text-center">
-                    <span className="text-zinc-300 text-sm font-medium block">Drop image here</span>
-                    <span className="text-zinc-600 text-xs mt-1.5 block">or click to browse</span>
-                  </div>
-                </div>
+                <span className="text-[13px] text-[#999] group-hover:text-[#666] transition-colors">
+                  or drop your own
+                </span>
                 <input type="file" className="hidden" accept="image/*" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); }} />
               </label>
-
-              <div className="flex flex-wrap justify-center gap-2">
-                {["Detect clothing layers", "Color-aware search", "Shop similar items"].map((t) => (
-                  <span key={t} className="text-[11px] text-zinc-500 bg-white/[0.03] border border-white/[0.06] rounded-full px-3 py-1">
-                    {t}
-                  </span>
-                ))}
-              </div>
             </div>
           ) : (
-            <div className="flex flex-col items-center gap-5 w-full animate-fade-in-scale">
+            <div className="flex flex-col items-center w-full animate-fade-in-scale">
               {/* Status */}
               {stage === "encoding" && (
-                <div className="flex flex-col items-center gap-2 bg-white/[0.03] border border-white/[0.06] rounded-xl px-5 py-3 backdrop-blur-sm min-w-[260px]">
+                <div className="flex flex-col items-center gap-2 bg-white border border-[#e8e5df] rounded-xl px-5 py-3 shadow-sm min-w-[260px] mb-5">
                   <div className="flex items-center justify-between w-full">
-                    <span className="text-sm text-zinc-400">{statusText}</span>
-                    <span className="text-xs text-zinc-500 tabular-nums">{progress}%</span>
+                    <span className="text-sm text-[#666]">{statusText}</span>
+                    <span className="text-xs text-[#aaa] tabular-nums">{progress}%</span>
                   </div>
-                  <div className="w-full h-1 bg-white/[0.06] rounded-full overflow-hidden">
+                  <div className="w-full h-1 bg-[#e8e5df] rounded-full overflow-hidden">
                     <div
-                      className="h-full bg-gradient-to-r from-purple-500 to-blue-500 rounded-full transition-all duration-200 ease-out"
+                      className="h-full bg-[#1a1a1a] rounded-full transition-all duration-200 ease-out"
                       style={{ width: `${progress}%` }}
                     />
                   </div>
                 </div>
               )}
 
-              {stage === "ready" && (
-                <div className="flex items-center gap-2 text-[13px] text-zinc-500">
-                  <div className="w-1.5 h-1.5 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.5)]" />
-                  {statusText}
-                </div>
-              )}
-
               {stage === "idle" && statusText && (
-                <div className="text-sm text-red-400/80 bg-red-500/[0.06] border border-red-500/10 rounded-xl px-4 py-2.5">{statusText}</div>
+                <div className="text-sm text-red-600 bg-red-50 border border-red-100 rounded-xl px-4 py-2.5 mb-5">{statusText}</div>
               )}
 
               {/* Canvas stack */}
-              <div className="relative inline-block rounded-2xl overflow-hidden shadow-2xl shadow-black/50 ring-1 ring-white/[0.06]">
+              <div className="relative inline-block rounded-2xl overflow-hidden shadow-lg shadow-black/8 ring-1 ring-black/5">
                 <canvas ref={canvasRef} className="block" />
                 <canvas ref={dripRef} className="absolute inset-0 w-full h-full pointer-events-none transition-opacity duration-300 ease-out" style={{ zIndex: 1, opacity: 0 }} />
                 <canvas ref={overlayARef} className="absolute inset-0 w-full h-full pointer-events-none transition-opacity duration-300 ease-out" style={{ zIndex: 11 }} />
@@ -680,12 +717,11 @@ export default function Home() {
                       height: focusBox.h,
                       borderRadius: 12,
                       boxShadow: focusDimmed
-                        ? "0 0 0 9999px rgba(0, 0, 0, 0.45)"
+                        ? "0 0 0 9999px rgba(0, 0, 0, 0.35)"
                         : "0 0 0 9999px rgba(0, 0, 0, 0)",
                       zIndex: 10,
                     }}
                   >
-                    {/* Top-right corner */}
                     <svg
                       className="absolute focus-box-transition"
                       style={{ top: -10, right: -10, opacity: focusDimmed ? 1 : 0, zIndex: 12 }}
@@ -693,7 +729,6 @@ export default function Home() {
                     >
                       <path d="M2 2A20 20 0 0 1 22 22" stroke="rgba(255,255,255,0.85)" strokeWidth="4.5" strokeLinecap="round" />
                     </svg>
-                    {/* Bottom-left corner */}
                     <svg
                       className="absolute focus-box-transition"
                       style={{ bottom: -10, left: -10, opacity: focusDimmed ? 1 : 0, zIndex: 12 }}
@@ -718,79 +753,51 @@ export default function Home() {
 
         {/* Right: Product panel */}
         <div
-          className={`border-l border-white/[0.04] bg-zinc-950/60 backdrop-blur-xl overflow-y-auto transition-all duration-500 ease-in-out ${
-            selectedCategory ? "lg:w-[400px]" : "lg:w-0 lg:border-0 lg:overflow-hidden"
+          style={{ containerType: "inline-size" }}
+          className={`bg-[#F8F7F4] overflow-y-auto transition-all duration-500 ease-in-out shrink-0 hidden lg:block ${
+            selectedCategory ? "lg:w-[50vw] border-[#e8e5df]" : "lg:w-0 lg:border-0 lg:overflow-hidden"
           }`}
         >
           {selectedCategory && (
-            <div className="p-5 animate-fade-in">
-              {/* Panel header */}
-              <div className="flex items-center justify-between mb-4">
-                <div>
-                  <h2 className="text-[13px] font-semibold text-zinc-200">
-                    Similar {selectedCategory}
-                  </h2>
-                  {searchQuery && (
-                    <p className="text-[11px] text-zinc-600 mt-0.5 truncate max-w-[260px]">
-                      &ldquo;{searchQuery}&rdquo;
-                    </p>
-                  )}
-                </div>
-                <button
-                  onClick={closePanel}
-                  className="text-zinc-600 hover:text-zinc-300 transition-colors p-1"
-                >
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </button>
-              </div>
-
-              {/* Loading */}
+            <div className="p-6 animate-fade-in">
+              {/* Skeleton loading */}
               {searching && (
-                <div className="flex flex-col items-center justify-center py-20 gap-3">
-                  <div className="relative w-7 h-7">
-                    <div className="absolute inset-0 rounded-full border-2 border-white/[0.06]" />
-                    <div className="absolute inset-0 rounded-full border-2 border-t-purple-400 border-r-transparent animate-spin" />
-                  </div>
-                  <span className="text-xs text-zinc-500">Searching...</span>
+                <div className="masonry-tight">
+                  {Array.from({ length: 9 }).map((_, i) => (
+                    <div
+                      key={i}
+                      className="rounded-lg bg-[#EDEAE5] animate-pulse"
+                      style={{ height: [180, 240, 200, 260, 190, 230, 210, 250, 220][i] }}
+                    />
+                  ))}
                 </div>
               )}
 
               {/* No results */}
               {!searching && products.length === 0 && searchQuery && (
                 <div className="text-center py-16">
-                  <p className="text-sm text-zinc-600">No products found</p>
-                  <p className="text-xs text-zinc-700 mt-1">Try a different garment</p>
+                  <p className="text-sm text-[#999]">No products found</p>
                 </div>
               )}
 
-              {/* Product grid */}
-              <div className="grid grid-cols-2 gap-2.5 stagger-children">
+              {/* Product masonry */}
+              <div className="masonry-tight stagger-children">
                 {products.filter((p) => !failedImages.has(p.image)).map((product, i) => (
                   <div
                     key={`${product.id}-${i}`}
-                    className="group rounded-xl overflow-hidden border border-white/[0.04] hover:border-white/[0.1] bg-white/[0.02] hover:bg-white/[0.05] transition-all duration-200"
+                    className="group rounded-lg overflow-hidden cursor-pointer"
                   >
-                    <div className="aspect-square bg-zinc-900 overflow-hidden">
-                      {product.image && (
-                        /* eslint-disable-next-line @next/next/no-img-element */
-                        <img
-                          src={product.image}
-                          alt={product.name}
-                          className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500 ease-out"
-                          loading="lazy"
-                          onError={() => { setFailedImages((prev) => new Set(prev).add(product.image)); }}
-                        />
-                      )}
-                    </div>
-                    <div className="p-2.5 space-y-1">
-                      <p className="text-[10px] text-zinc-600 uppercase tracking-wider font-medium">{product.brand}</p>
-                      <p className="text-[13px] text-zinc-300 leading-snug line-clamp-2">{product.name}</p>
-                      {product.price && (
-                        <p className="text-[13px] font-semibold text-white">{product.price}</p>
-                      )}
-                    </div>
+                    {product.image && (
+                      /* eslint-disable-next-line @next/next/no-img-element */
+                      <img
+                        src={product.image.startsWith("/") ? `${API_BASE}${product.image}` : product.image}
+                        alt={product.name}
+                        className="product-img w-full h-auto block rounded-lg group-hover:brightness-[0.92] transition-[filter] duration-300"
+                        loading="lazy"
+                        onLoad={(e) => e.currentTarget.classList.add("loaded")}
+                        onError={() => { setFailedImages((prev) => new Set(prev).add(product.image)); }}
+                      />
+                    )}
                   </div>
                 ))}
               </div>
