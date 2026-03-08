@@ -754,7 +754,7 @@ function Home() {
               </div>
 
               {/* Sample images — masonry */}
-              <div className="w-full py-8" ref={(el) => { if (el) console.log("[gallery] container mounted, offsetWidth:", el.offsetWidth, "offsetHeight:", el.offsetHeight, "children:", el.children.length, "innerHTML length:", el.innerHTML.length); }}>
+              <div className="w-full py-6" ref={(el) => { if (el) console.log("[gallery] container mounted, offsetWidth:", el.offsetWidth, "offsetHeight:", el.offsetHeight, "children:", el.children.length, "innerHTML length:", el.innerHTML.length); }}>
                 <MasonryPhotoAlbum
                   photos={SAMPLE_PHOTOS}
                   columns={3}
@@ -782,11 +782,7 @@ function Home() {
             </div>
           ) : (
             <div className="flex flex-col items-center w-full animate-fade-in-scale">
-              {stage === "idle" && statusText && (
-                <div className="text-sm text-red-600 bg-red-50 border border-red-100 rounded-xl px-4 py-2.5 mb-5">{statusText}</div>
-              )}
-
-              {/* Canvas stack */}
+                {/* Canvas stack */}
               <div className="relative inline-block rounded-2xl overflow-hidden shadow-lg shadow-black/8 ring-1 ring-black/5">
                 <canvas ref={canvasRef} className="block" />
 
@@ -889,6 +885,11 @@ function Home() {
                   onClick={handleClick}
                 />
               </div>
+
+              {/* Error message below the image */}
+              {stage === "idle" && statusText && (
+                <div className="text-sm text-red-600 bg-red-50 border border-red-100 rounded-xl px-4 py-2.5 mt-4">{statusText}</div>
+              )}
 
               {/* Analyzing message below the image */}
               {stage === "encoding" && (
