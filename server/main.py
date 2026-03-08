@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import base64
 import hashlib
@@ -243,6 +244,30 @@ async def startup():
     else:
         print("WARNING: QDRANT_URL / QDRANT_API_KEY not set, search disabled")
 
+    # Load pre-computed sample segmentation maps
+    _cache_dir = Path(__file__).parent / "static" / "sample_cache"
+    _manifest_path = _cache_dir / "manifest.json"
+    if _manifest_path.exists():
+        with open(_manifest_path) as f:
+            manifest = json.load(f)
+        loaded = 0
+        for filename, meta in manifest.items():
+            h = meta["hash"]
+            ext = meta.get("ext", ".jpg")
+            npy_path = _cache_dir / f"{h}.npy"
+            img_path = _cache_dir / f"{h}{ext}"
+            if npy_path.exists() and img_path.exists() and h not in seg_cache:
+                seg_map = np.load(npy_path)
+                img = Image.open(img_path).convert("RGB")
+                seg_cache[h] = {
+                    "seg_map": seg_map,
+                    "orig_w": meta["orig_w"],
+                    "orig_h": meta["orig_h"],
+                    "image": img,
+                }
+                loaded += 1
+        print(f"Loaded {loaded} pre-computed sample(s)")
+
 
 
 @app.post("/api/encode")
@@ -418,6 +443,18 @@ async def clothing_mask(body: dict):
     buf = io.BytesIO()
     mask_img.save(buf, format="PNG")
     return {"mask": base64.b64encode(buf.getvalue()).decode()}
+
+
+@app.get("/api/sample-hashes")
+async def sample_hashes():
+    """Return pre-computed hashes for sample images."""
+    _manifest_path = Path(__file__).parent / "static" / "sample_cache" / "manifest.json"
+    if not _manifest_path.exists():
+        return {}
+    with open(_manifest_path) as f:
+        manifest = json.load(f)
+    # Map "/samples/{filename}" → hash
+    return {f"/samples/{k}": v["hash"] for k, v in manifest.items()}
 
 
 @app.get("/api/health")

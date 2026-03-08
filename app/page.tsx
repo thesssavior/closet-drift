@@ -10,6 +10,7 @@ import {
   searchProducts,
   findSimilar,
   fetchClothingMask,
+  fetchSampleHashes,
   API_BASE,
   type Product,
 } from "./lib/sam2";
@@ -106,6 +107,12 @@ function Home() {
   const [dripVisible, setDripVisible] = useState(false);
   const [focusMaskUrl, setFocusMaskUrl] = useState<string | null>(null);
   const dripId = useRef(`d${Math.random().toString(36).slice(2, 8)}`).current;
+  const sampleHashesRef = useRef<Record<string, string>>({});
+
+  // Fetch pre-computed sample hashes on mount
+  useEffect(() => {
+    fetchSampleHashes().then((h) => { sampleHashesRef.current = h; });
+  }, []);
 
   const drawImage = useCallback((img: HTMLImageElement) => {
     const canvas = canvasRef.current;
@@ -249,15 +256,45 @@ function Home() {
   const handleSampleClick = useCallback(
     async (src: string) => {
       try {
-        const res = await fetch(src);
-        const blob = await res.blob();
-        const file = new File([blob], src.split("/").pop() || "sample.jpg", { type: blob.type });
-        processImage(file, src);
+        const cachedHash = sampleHashesRef.current[src];
+        if (cachedHash) {
+          // Pre-computed — skip encoding, go straight to ready
+          setImageSrc(src);
+          setProducts([]); setFailedImages(new Set());
+          setSearchQuery("");
+          setSelectedCategory("");
+          setFocusBox(null);
+          setFocusDimmed(false);
+          focusDimmedRef.current = false;
+          lastCategoryRef.current = -1;
+          hashRef.current = cachedHash;
+
+          const img = new window.Image();
+          img.onload = () => {
+            imageRef.current = img;
+            drawImage(img);
+            setStage("ready");
+            setStatusText("Hover to detect — click to search");
+
+            const canvas = canvasRef.current;
+            if (canvas) {
+              fetchClothingMask(cachedHash, canvas.width, canvas.height)
+                .then((r) => { if (r.mask) startDripRef.current?.(r.mask); })
+                .catch(() => {});
+            }
+          };
+          img.src = src;
+        } else {
+          const res = await fetch(src);
+          const blob = await res.blob();
+          const file = new File([blob], src.split("/").pop() || "sample.jpg", { type: blob.type });
+          processImage(file, src);
+        }
       } catch (err: any) {
         setStatusText(`Error loading sample: ${err.message}`);
       }
     },
-    [processImage]
+    [processImage, drawImage]
   );
 
   // --- Mask rendering ---
@@ -312,10 +349,10 @@ function Home() {
             const a = maskData.data[i];
             if (a > 20) {
               const n = Math.min(a / 255, 1);
-              const soft = n * n * n * n;
+              const soft = n * n * n;
               const lum = (srcData.data[i] * 0.299 + srcData.data[i + 1] * 0.587 + srcData.data[i + 2] * 0.114) / 255;
-              // Shadows (~0): ~2%, midtones: ~5%, highlights (~1): ~10%
-              const strength = 0.02 + lum * lum * 0.3;
+              // Shadows (~0): ~5%, midtones: ~15%, highlights (~1): ~35%
+              const strength = 0.05 + lum * 0.15;
               out.data[i] = 255;
               out.data[i + 1] = 255;
               out.data[i + 2] = 255;

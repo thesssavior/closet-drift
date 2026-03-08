@@ -98,3 +98,13 @@ export async function findSimilar(
   if (!res.ok) throw new Error(`Similar failed: ${res.statusText}`);
   return res.json();
 }
+
+export async function fetchSampleHashes(): Promise<Record<string, string>> {
+  try {
+    const res = await fetch(`${API_BASE}/api/sample-hashes`);
+    if (!res.ok) return {};
+    return res.json();
+  } catch {
+    return {};
+  }
+}
