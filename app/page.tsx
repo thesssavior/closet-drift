@@ -6,10 +6,9 @@ import { MasonryPhotoAlbum } from "react-photo-album";
 import "react-photo-album/masonry.css";
 import {
   encodeImage,
-  decodeMask,
+  fetchSegMap,
   searchProducts,
   findSimilar,
-  fetchClothingMask,
   fetchSampleHashes,
   API_BASE,
   type Product,
@@ -98,16 +97,25 @@ function Home() {
   const maskImageDataRef = useRef<ImageData | null>(null);
   const clearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const focusDimmedRef = useRef(false);
+  const focusCategoryRef = useRef<number>(-1);
   const clickGenRef = useRef(0);
   const startDripRef = useRef<((maskB64: string) => void) | null>(null);
   const dripMaskUrlRef = useRef<string | null>(null);
   const fullMaskB64Ref = useRef<string | null>(null);
   const focusMaskUrlRef = useRef<string | null>(null);
-  const [dripState, setDripState] = useState<{ maskUrl: string; width: number; height: number } | null>(null);
+  const [dripState, setDripState] = useState<{ segId: number; maskUrl: string; width: number; height: number; garmentWidth: number; garmentHeight: number }[] | null>(null);
+  const [focusCategory, setFocusCategory] = useState(-1);
   const [dripVisible, setDripVisible] = useState(false);
   const [focusMaskUrl, setFocusMaskUrl] = useState<string | null>(null);
   const dripId = useRef(`d${Math.random().toString(36).slice(2, 8)}`).current;
   const sampleHashesRef = useRef<Record<string, string>>({});
+  // Local seg_map data for zero-latency hover
+  const segMapPixelsRef = useRef<Uint8Array | null>(null);
+  const segMapDimsRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
+  const labelsRef = useRef<Record<number, string>>({});
+  const clothingIdsRef = useRef<Set<number>>(new Set());
+  const maskCacheRef = useRef<Map<number, string>>(new Map());
+  const rebuildMaskCacheRef = useRef<(() => void) | null>(null);
 
   // Fetch pre-computed sample hashes on mount
   useEffect(() => {
@@ -154,6 +162,8 @@ function Home() {
         }
       }
       lastCategoryRef.current = -1;
+      // Rebuild mask cache at new canvas dimensions
+      rebuildMaskCacheRef.current?.();
     });
     observer.observe(container);
     return () => observer.disconnect();
@@ -196,6 +206,125 @@ function Home() {
     []
   );
 
+  // Decode a base64 seg_map PNG into pixel data and store in refs
+  const loadSegMap = useCallback((segMapB64: string, labels: Record<string, string>, clothingIds: number[]) => {
+    return new Promise<void>((resolve) => {
+      const img = new window.Image();
+      img.onload = () => {
+        const tmp = document.createElement("canvas");
+        tmp.width = img.width;
+        tmp.height = img.height;
+        const ctx = tmp.getContext("2d")!;
+        ctx.drawImage(img, 0, 0);
+        const data = ctx.getImageData(0, 0, img.width, img.height);
+        // Extract single channel (R) — category IDs are stored as grayscale pixel values
+        const pixels = new Uint8Array(img.width * img.height);
+        for (let i = 0; i < pixels.length; i++) {
+          pixels[i] = data.data[i * 4];
+        }
+        segMapPixelsRef.current = pixels;
+        segMapDimsRef.current = { w: img.width, h: img.height };
+        const labelMap: Record<number, string> = {};
+        for (const [k, v] of Object.entries(labels)) labelMap[Number(k)] = v;
+        labelsRef.current = labelMap;
+        clothingIdsRef.current = new Set(clothingIds);
+        resolve();
+      };
+      img.src = `data:image/png;base64,${segMapB64}`;
+    });
+  }, []);
+
+  // Look up category at canvas coordinates using local seg_map
+  const lookupCategory = useCallback((canvasX: number, canvasY: number): { categoryId: number; category: string } | null => {
+    const pixels = segMapPixelsRef.current;
+    if (!pixels) return null;
+    const { scale } = dimsRef.current;
+    const { w, h } = segMapDimsRef.current;
+    const origX = Math.max(0, Math.min(Math.floor(canvasX / scale), w - 1));
+    const origY = Math.max(0, Math.min(Math.floor(canvasY / scale), h - 1));
+    const categoryId = pixels[origY * w + origX];
+    return { categoryId, category: labelsRef.current[categoryId] || "Unknown" };
+  }, []);
+
+  // Build mask PNG for a given category at canvas dimensions
+  const buildMaskB64 = useCallback((categoryId: number, canvasW: number, canvasH: number): string => {
+    const pixels = segMapPixelsRef.current!;
+    const { w: origW, h: origH } = segMapDimsRef.current;
+
+    // Build binary mask at original resolution
+    const origCanvas = document.createElement("canvas");
+    origCanvas.width = origW;
+    origCanvas.height = origH;
+    const origCtx = origCanvas.getContext("2d")!;
+    const origData = origCtx.createImageData(origW, origH);
+    for (let i = 0; i < pixels.length; i++) {
+      const v = pixels[i] === categoryId ? 255 : 0;
+      origData.data[i * 4] = v;
+      origData.data[i * 4 + 1] = v;
+      origData.data[i * 4 + 2] = v;
+      origData.data[i * 4 + 3] = 255;
+    }
+    origCtx.putImageData(origData, 0, 0);
+
+    // Resize to canvas dimensions with blur for smooth edges
+    const out = document.createElement("canvas");
+    out.width = canvasW;
+    out.height = canvasH;
+    const outCtx = out.getContext("2d")!;
+    outCtx.filter = "blur(2px)";
+    outCtx.drawImage(origCanvas, 0, 0, canvasW, canvasH);
+
+    return out.toDataURL("image/png").split(",")[1];
+  }, []);
+
+  // Build clothing mask (union of all clothing segments)
+  const buildClothingMaskB64 = useCallback((canvasW: number, canvasH: number): string => {
+    const pixels = segMapPixelsRef.current!;
+    const clothingIds = clothingIdsRef.current;
+    const { w: origW, h: origH } = segMapDimsRef.current;
+
+    const origCanvas = document.createElement("canvas");
+    origCanvas.width = origW;
+    origCanvas.height = origH;
+    const origCtx = origCanvas.getContext("2d")!;
+    const origData = origCtx.createImageData(origW, origH);
+    for (let i = 0; i < pixels.length; i++) {
+      const v = clothingIds.has(pixels[i]) ? 255 : 0;
+      origData.data[i * 4] = v;
+      origData.data[i * 4 + 1] = v;
+      origData.data[i * 4 + 2] = v;
+      origData.data[i * 4 + 3] = 255;
+    }
+    origCtx.putImageData(origData, 0, 0);
+
+    const out = document.createElement("canvas");
+    out.width = canvasW;
+    out.height = canvasH;
+    const outCtx = out.getContext("2d")!;
+    outCtx.filter = "blur(2px)";
+    outCtx.drawImage(origCanvas, 0, 0, canvasW, canvasH);
+    return out.toDataURL("image/png").split(",")[1];
+  }, []);
+
+  // Pre-build masks for all clothing categories at current canvas size
+  const rebuildMaskCache = useCallback(() => {
+    const canvas = canvasRef.current;
+    const pixels = segMapPixelsRef.current;
+    if (!canvas || !pixels) return;
+    const clothingIds = clothingIdsRef.current;
+    const cache = new Map<number, string>();
+    // Find which clothing categories exist in this image
+    const found = new Set<number>();
+    for (let i = 0; i < pixels.length; i++) {
+      if (clothingIds.has(pixels[i])) found.add(pixels[i]);
+    }
+    for (const cid of found) {
+      cache.set(cid, buildMaskB64(cid, canvas.width, canvas.height));
+    }
+    maskCacheRef.current = cache;
+  }, [buildMaskB64]);
+  rebuildMaskCacheRef.current = rebuildMaskCache;
+
   const processImage = useCallback(
     async (file: File, url: string) => {
       setImageSrc(url);
@@ -227,14 +356,18 @@ function Home() {
           clearInterval(interval);
           setProgress(100);
           hashRef.current = result.hash;
+
+          // Load seg_map locally and pre-build masks
+          await loadSegMap(result.segMap, result.labels, result.clothingIds);
+          rebuildMaskCache();
+
           setStage("ready");
           setStatusText("Hover to detect — click to search");
 
           const canvas = canvasRef.current;
           if (canvas) {
-            fetchClothingMask(result.hash, canvas.width, canvas.height)
-              .then((r) => { if (r.mask) startDripRef.current?.(r.mask); })
-              .catch(() => {});
+            const clothingMask = buildClothingMaskB64(canvas.width, canvas.height);
+            startDripRef.current?.(clothingMask);
           }
         } catch (err: any) {
           setStage("idle");
@@ -244,7 +377,7 @@ function Home() {
       };
       img.src = url;
     },
-    [drawImage]
+    [drawImage, loadSegMap, rebuildMaskCache, buildClothingMaskB64]
   );
 
   const handleFile = useCallback(
@@ -272,17 +405,24 @@ function Home() {
           hashRef.current = cachedHash;
 
           const img = new window.Image();
-          img.onload = () => {
+          img.onload = async () => {
             imageRef.current = img;
             drawImage(img);
+
+            // Fetch seg_map for cached sample
+            try {
+              const segData = await fetchSegMap(cachedHash);
+              await loadSegMap(segData.segMap, segData.labels, segData.clothingIds);
+              rebuildMaskCache();
+            } catch {}
+
             setStage("ready");
             setStatusText("Hover to detect — click to search");
 
             const canvas = canvasRef.current;
-            if (canvas) {
-              fetchClothingMask(cachedHash, canvas.width, canvas.height)
-                .then((r) => { if (r.mask) startDripRef.current?.(r.mask); })
-                .catch(() => {});
+            if (canvas && segMapPixelsRef.current) {
+              const clothingMask = buildClothingMaskB64(canvas.width, canvas.height);
+              startDripRef.current?.(clothingMask);
             }
           };
           img.src = src;
@@ -296,7 +436,7 @@ function Home() {
         setStatusText(`Error loading sample: ${err.message}`);
       }
     },
-    [processImage, drawImage]
+    [processImage, drawImage, loadSegMap, rebuildMaskCache, buildClothingMaskB64]
   );
 
   // --- Mask rendering ---
@@ -354,7 +494,7 @@ function Home() {
               const soft = n * n * n;
               const lum = (srcData.data[i] * 0.299 + srcData.data[i + 1] * 0.587 + srcData.data[i + 2] * 0.114) / 255;
               // Shadows (~0): ~5%, midtones: ~15%, highlights (~1): ~35%
-              const strength = 0.05 + lum * 0.15;
+              const strength = 0.05 + lum * 0.07;
               out.data[i] = 255;
               out.data[i + 1] = 255;
               out.data[i + 2] = 255;
@@ -397,36 +537,85 @@ function Home() {
     fullMaskB64Ref.current = maskB64;
     const w = canvas.width, h = canvas.height;
 
-    const maskImg = new window.Image();
-    maskImg.onload = () => {
-      // Create feathered mask: blur edges + gamma curve
-      const tmp = document.createElement("canvas");
-      tmp.width = w; tmp.height = h;
-      const ctx = tmp.getContext("2d")!;
-      ctx.filter = "blur(8px)";
-      ctx.drawImage(maskImg, 0, 0, w, h);
-      ctx.filter = "none";
+    // Build per-garment drip masks from the mask cache
+    const garmentMasks = maskCacheRef.current;
+    if (garmentMasks.size === 0) return;
 
-      const d = ctx.getImageData(0, 0, w, h);
-      for (let i = 0; i < d.data.length; i += 4) {
-        const v = d.data[i] / 255;
-        d.data[i] = 255;
-        d.data[i + 1] = 255;
-        d.data[i + 2] = 255;
-        d.data[i + 3] = Math.round(v * v * 255); // gamma exponent=2
-      }
-      ctx.putImageData(d, 0, 0);
+    // Filter by label name: skip shoes, skip inner layers when outer exists
+    const labels = labelsRef.current;
+    const SHOE_LABELS = /shoe/i;
+    const OUTER_LABELS = /jacket|coat|cardigan|cape/i;
+    const INNER_LABELS = /shirt|blouse|top|t-shirt|sweatshirt|sweater/i;
 
-      tmp.toBlob((blob) => {
-        if (!blob) return;
-        const url = URL.createObjectURL(blob);
-        if (dripMaskUrlRef.current) URL.revokeObjectURL(dripMaskUrlRef.current);
-        dripMaskUrlRef.current = url;
-        setDripState({ maskUrl: url, width: w, height: h });
-        setDripVisible(true);
-      });
-    };
-    maskImg.src = `data:image/png;base64,${maskB64}`;
+    const allIds = new Set(garmentMasks.keys());
+    const hasOuter = [...allIds].some(id => OUTER_LABELS.test(labels[id] || ""));
+
+    const filteredMasks = new Map<number, string>();
+    for (const [segId, b64] of garmentMasks) {
+      const label = labels[segId] || "";
+      if (SHOE_LABELS.test(label)) continue;
+      if (hasOuter && INNER_LABELS.test(label)) continue;
+      filteredMasks.set(segId, b64);
+    }
+    console.log(`[drip] all: [${[...allIds].map(id => `${id}=${labels[id]}`).join(', ')}] hasOuter:${hasOuter} → kept: [${[...filteredMasks.keys()].map(id => `${id}=${labels[id]}`).join(', ')}]`);
+    if (filteredMasks.size === 0) return;
+
+    // Clean up old URLs
+    if (dripMaskUrlRef.current) {
+      for (const u of dripMaskUrlRef.current.split(",")) URL.revokeObjectURL(u);
+    }
+
+    const entries: { segId: number; maskUrl: string; width: number; height: number; garmentWidth: number; garmentHeight: number }[] = [];
+    const urls: string[] = [];
+    let remaining = filteredMasks.size;
+
+    for (const [segId, b64] of filteredMasks) {
+      const capturedSegId = segId;
+      const img = new window.Image();
+      img.onload = () => {
+        const tmp = document.createElement("canvas");
+        tmp.width = w; tmp.height = h;
+        const ctx = tmp.getContext("2d")!;
+        ctx.filter = "blur(4px)";
+        ctx.drawImage(img, 0, 0, w, h);
+        ctx.filter = "none";
+
+        const d = ctx.getImageData(0, 0, w, h);
+        // Compute bbox of this garment mask before modifying pixel data
+        const bbox = computeBboxFromMask(d, 0);
+        for (let i = 0; i < d.data.length; i += 4) {
+          const v = d.data[i] / 255;
+          // Steeper falloff (v^3) + threshold cutoff to prevent halo bleed
+          const a = v * v * v;
+          d.data[i] = 255;
+          d.data[i + 1] = 255;
+          d.data[i + 2] = 255;
+          d.data[i + 3] = a < 0.05 ? 0 : Math.round(a * 255);
+        }
+        ctx.putImageData(d, 0, 0);
+
+        tmp.toBlob((blob) => {
+          if (!blob) return;
+          const url = URL.createObjectURL(blob);
+          urls.push(url);
+          entries.push({
+            segId: capturedSegId,
+            maskUrl: url,
+            width: w,
+            height: h,
+            garmentWidth: bbox ? bbox.w : w,
+            garmentHeight: bbox ? bbox.h : h,
+          });
+          remaining--;
+          if (remaining === 0) {
+            dripMaskUrlRef.current = urls.join(",");
+            setDripState(entries);
+            setDripVisible(true);
+          }
+        });
+      };
+      img.src = `data:image/png;base64,${b64}`;
+    }
   }, []);
   startDripRef.current = startDrip;
 
@@ -491,16 +680,17 @@ function Home() {
     }
     setFocusDimmed(false);
     focusDimmedRef.current = false;
+    focusCategoryRef.current = -1;
+    setFocusCategory(-1);
     setFocusMaskUrl(null);
     if (focusMaskUrlRef.current) { URL.revokeObjectURL(focusMaskUrlRef.current); focusMaskUrlRef.current = null; }
     setTimeout(() => setFocusBox(null), 400);
     // Restart drip if it was cleared (e.g. by reset)
-    if (!dripMaskUrlRef.current && hashRef.current && canvas) {
-      fetchClothingMask(hashRef.current, canvas.width, canvas.height)
-        .then((r) => { if (r.mask) startDrip(r.mask); })
-        .catch(() => {});
+    if (!dripMaskUrlRef.current && segMapPixelsRef.current && canvas) {
+      const clothingMask = buildClothingMaskB64(canvas.width, canvas.height);
+      startDrip(clothingMask);
     }
-  }, [startDrip]);
+  }, [startDrip, buildClothingMaskB64]);
 
   const handleMouseLeave = useCallback(() => {
     clearOverlay();
@@ -508,10 +698,10 @@ function Home() {
   }, [clearOverlay]);
 
   const handleHover = useCallback(
-    async (e: React.MouseEvent<HTMLElement>) => {
-      if (stage !== "ready" || !hashRef.current) return;
+    (e: React.MouseEvent<HTMLElement>) => {
+      if (stage !== "ready" || !segMapPixelsRef.current) return;
       const now = Date.now();
-      if (now - hoverThrottleRef.current < 100) return;
+      if (now - hoverThrottleRef.current < 30) return;
       hoverThrottleRef.current = now;
 
       const rect = canvasRef.current!.getBoundingClientRect();
@@ -519,8 +709,9 @@ function Home() {
       const cy = e.clientY - rect.top;
 
       if (focusDimmedRef.current && focusBox) {
-        if (cx >= focusBox.x && cx <= focusBox.x + focusBox.w &&
-            cy >= focusBox.y && cy <= focusBox.y + focusBox.h) {
+        // When focused, only allow hover on different clothing items (not the focused one)
+        const result = lookupCategory(cx, cy);
+        if (!result || !clothingIdsRef.current.has(result.categoryId) || result.categoryId === focusCategoryRef.current) {
           if (lastCategoryRef.current !== -1) {
             lastCategoryRef.current = -1;
             clearOverlay();
@@ -529,24 +720,27 @@ function Home() {
         }
       }
 
-      const { x, y } = canvasToModelCoords(cx, cy);
-      const canvas = canvasRef.current!;
+      const result = lookupCategory(cx, cy);
+      if (!result) return;
 
-      try {
-        const result = await decodeMask(hashRef.current, x, y, canvas.width, canvas.height);
-        if (result.mask) {
-          if (result.categoryId === lastCategoryRef.current) return;
-          lastCategoryRef.current = result.categoryId;
-          lastHoverResultRef.current = { mask: result.mask, category: result.category, categoryId: result.categoryId };
-          renderMask(result.mask, result.categoryId);
-        } else {
+      const { categoryId, category } = result;
+      if (clothingIdsRef.current.has(categoryId)) {
+        if (categoryId === lastCategoryRef.current) return;
+        lastCategoryRef.current = categoryId;
+        const maskB64 = maskCacheRef.current.get(categoryId);
+        if (maskB64) {
+          lastHoverResultRef.current = { mask: maskB64, category, categoryId };
+          renderMask(maskB64, categoryId);
+        }
+      } else {
+        if (lastCategoryRef.current !== -1) {
           lastCategoryRef.current = -1;
           lastHoverResultRef.current = null;
           clearOverlay();
         }
-      } catch {}
+      }
     },
-    [stage, canvasToModelCoords, renderMask, clearOverlay, focusBox]
+    [stage, lookupCategory, renderMask, clearOverlay, focusBox]
   );
 
   const animateFocusBox = useCallback((bbox: { x: number; y: number; w: number; h: number }) => {
@@ -592,14 +786,17 @@ function Home() {
 
   const handleClick = useCallback(
     (e: React.MouseEvent<HTMLElement>) => {
-      if (stage !== "ready" || !hashRef.current) return;
+      if (stage !== "ready" || !hashRef.current || !segMapPixelsRef.current) return;
       const rect = canvasRef.current!.getBoundingClientRect();
       const canvasX = e.clientX - rect.left;
       const canvasY = e.clientY - rect.top;
 
       if (focusDimmedRef.current && focusBox) {
-        if (canvasX >= focusBox.x && canvasX <= focusBox.x + focusBox.w &&
-            canvasY >= focusBox.y && canvasY <= focusBox.y + focusBox.h) {
+        // Check if clicking on a different clothing item — if so, let it switch
+        const hoverResult = lookupCategory(canvasX, canvasY);
+        const clickedDifferentGarment = hoverResult && clothingIdsRef.current.has(hoverResult.categoryId) && hoverResult.categoryId !== focusCategoryRef.current;
+        if (!clickedDifferentGarment) {
+          // Clicking on focused garment or non-clothing — dismiss
           dismissFocus();
           clearOverlay();
           setProducts([]); setFailedImages(new Set());
@@ -608,11 +805,11 @@ function Home() {
           lastCategoryRef.current = -1;
           return;
         }
+        // Fall through to handle the new garment click
       }
-      const { x, y } = canvasToModelCoords(canvasX, canvasY);
+
       const canvas = canvasRef.current!;
       const hash = hashRef.current;
-
       const gen = ++clickGenRef.current;
 
       clearOverlay();
@@ -620,50 +817,53 @@ function Home() {
       setProducts([]); setFailedImages(new Set());
       setSearchQuery("");
 
-      decodeMask(hash, x, y, canvas.width, canvas.height).then((result) => {
-        if (clickGenRef.current !== gen) return;
+      const result = lookupCategory(canvasX, canvasY);
+      if (!result) { setSearching(false); return; }
 
-        if (result.mask) {
-          decodeMaskToBbox(result.mask, canvas.width, canvas.height).then((bbox) => {
+      const { categoryId, category } = result;
+
+      if (clothingIdsRef.current.has(categoryId)) {
+        focusCategoryRef.current = categoryId;
+        setFocusCategory(categoryId);
+        const maskB64 = maskCacheRef.current.get(categoryId);
+        if (maskB64) {
+          decodeMaskToBbox(maskB64, canvas.width, canvas.height).then((bbox) => {
             if (clickGenRef.current !== gen) return;
             if (bbox) animateFocusBox(bbox);
           });
-          buildFocusMask(result.mask, canvas.width, canvas.height);
-
-          setSelectedCategory(result.category);
-          textSearchRef.current = { hash, categoryId: result.categoryId };
-          similarIdRef.current = null;
-          offsetRef.current = 0;
-          setHasMore(true);
-
-          searchProducts(hash, result.categoryId).then((sr) => {
-            if (clickGenRef.current !== gen) return;
-            setSearchQuery(sr.query);
-            setProducts(sr.products);
-            setSearching(false);
-            setHasMore(sr.products.length >= 100);
-            offsetRef.current = sr.products.length;
-            // Push URL state
-            const params = new URLSearchParams();
-            params.set("q", sr.query);
-            params.set("cat", String(result.categoryId));
-            router.push(`/?${params.toString()}`, { scroll: false });
-          }).catch(() => {
-            if (clickGenRef.current === gen) setSearching(false);
-          });
-        } else {
-          const size = 120;
-          const bx = Math.max(0, Math.min(canvas.width - size, canvasX - size / 2));
-          const by = Math.max(0, Math.min(canvas.height - size, canvasY - size / 2));
-          animateFocusBox({ x: bx, y: by, w: size, h: size });
-          setSelectedCategory("");
-          setSearching(false);
+          buildFocusMask(maskB64, canvas.width, canvas.height);
         }
-      }).catch(() => {
-        if (clickGenRef.current === gen) setSearching(false);
-      });
+
+        setSelectedCategory(category);
+        textSearchRef.current = { hash, categoryId };
+        similarIdRef.current = null;
+        offsetRef.current = 0;
+        setHasMore(true);
+
+        searchProducts(hash, categoryId).then((sr) => {
+          if (clickGenRef.current !== gen) return;
+          setSearchQuery(sr.query);
+          setProducts(sr.products);
+          setSearching(false);
+          setHasMore(sr.products.length >= 100);
+          offsetRef.current = sr.products.length;
+          const params = new URLSearchParams();
+          params.set("q", sr.query);
+          params.set("cat", String(categoryId));
+          router.push(`/?${params.toString()}`, { scroll: false });
+        }).catch(() => {
+          if (clickGenRef.current === gen) setSearching(false);
+        });
+      } else {
+        const size = 120;
+        const bx = Math.max(0, Math.min(canvas.width - size, canvasX - size / 2));
+        const by = Math.max(0, Math.min(canvas.height - size, canvasY - size / 2));
+        animateFocusBox({ x: bx, y: by, w: size, h: size });
+        setSelectedCategory("");
+        setSearching(false);
+      }
     },
-    [stage, canvasToModelCoords, clearOverlay, animateFocusBox, decodeMaskToBbox, focusBox, dismissFocus, buildFocusMask]
+    [stage, lookupCategory, clearOverlay, animateFocusBox, decodeMaskToBbox, focusBox, dismissFocus, buildFocusMask]
   );
 
   // Handle clicking a product card → find similar
@@ -732,10 +932,12 @@ function Home() {
   const reset = () => {
     stopDrip();
     setDripState(null);
-    if (dripMaskUrlRef.current) { URL.revokeObjectURL(dripMaskUrlRef.current); dripMaskUrlRef.current = null; }
+    if (dripMaskUrlRef.current) { for (const u of dripMaskUrlRef.current.split(",")) URL.revokeObjectURL(u); dripMaskUrlRef.current = null; }
     setFocusMaskUrl(null);
     if (focusMaskUrlRef.current) { URL.revokeObjectURL(focusMaskUrlRef.current); focusMaskUrlRef.current = null; }
     fullMaskB64Ref.current = null;
+    focusCategoryRef.current = -1;
+    setFocusCategory(-1);
     setImageSrc(null);
     setStage("idle");
     setStatusText("");
@@ -826,30 +1028,31 @@ function Home() {
                 <canvas ref={canvasRef} className="block" />
 
                 {/* Progress overlay removed — analyzing message now below image */}
-                {/* Pinterest-style glow sweep */}
-                {dripState && (
+                {/* Per-garment glow sweep */}
+                {dripState && dripState.map((drip, idx) => (
                   <div
+                    key={idx}
                     className="absolute inset-0 pointer-events-none"
                     style={{
                       zIndex: focusDimmed ? 11 : 1,
-                      opacity: dripVisible ? 1 : 0,
+                      opacity: dripVisible && !(focusDimmed && drip.segId === focusCategory) ? 1 : 0,
                       transition: "opacity 1.5s ease",
                     }}
                   >
                     <style>{`
-                      @keyframes ${dripId}-sweep {
-                        0%   { -webkit-mask-position: 0 ${Math.round(-dripState.height * 0.675)}px; mask-position: 0 ${Math.round(-dripState.height * 0.675)}px; opacity: 0; }
+                      @keyframes ${dripId}-sweep-${idx} {
+                        0%   { -webkit-mask-position: 0 ${Math.round(-drip.height * 0.675)}px; mask-position: 0 ${Math.round(-drip.height * 0.675)}px; opacity: 0; }
                         3%   { opacity: 0.5; }
-                        33%  { -webkit-mask-position: 0 ${Math.round(dripState.height * 0.675)}px; mask-position: 0 ${Math.round(dripState.height * 0.675)}px; opacity: 0.5; }
-                        34%  { -webkit-mask-position: 0 ${Math.round(dripState.height * 0.675)}px; mask-position: 0 ${Math.round(dripState.height * 0.675)}px; opacity: 0; }
-                        100% { -webkit-mask-position: 0 ${Math.round(-dripState.height * 0.675)}px; mask-position: 0 ${Math.round(-dripState.height * 0.675)}px; opacity: 0; }
+                        33%  { -webkit-mask-position: 0 ${Math.round(drip.height * 0.675)}px; mask-position: 0 ${Math.round(drip.height * 0.675)}px; opacity: 0.5; }
+                        34%  { -webkit-mask-position: 0 ${Math.round(drip.height * 0.675)}px; mask-position: 0 ${Math.round(drip.height * 0.675)}px; opacity: 0; }
+                        100% { -webkit-mask-position: 0 ${Math.round(-drip.height * 0.675)}px; mask-position: 0 ${Math.round(-drip.height * 0.675)}px; opacity: 0; }
                       }
                     `}</style>
                     <div
                       className="absolute inset-0"
                       style={{
-                        maskImage: `url(${focusDimmed && focusMaskUrl ? focusMaskUrl : dripState.maskUrl})`,
-                        WebkitMaskImage: `url(${focusDimmed && focusMaskUrl ? focusMaskUrl : dripState.maskUrl})`,
+                        maskImage: `url(${drip.maskUrl})`,
+                        WebkitMaskImage: `url(${drip.maskUrl})`,
                         maskSize: "100% 100%",
                         WebkitMaskSize: "100% 100%",
                         transition: "mask-image 0.3s ease, -webkit-mask-image 0.3s ease",
@@ -858,9 +1061,9 @@ function Home() {
                       <div
                         className="absolute inset-0"
                         style={{
-                          animation: `${dripId}-sweep 9s linear 5s infinite backwards`,
-                          maskImage: `radial-gradient(${Math.round(dripState.width * 2.5)}px ${Math.round(dripState.height * 0.35)}px, white 0%, white 15%, rgba(255,255,255,0.9) 30%, rgba(255,255,255,0.7) 45%, rgba(255,255,255,0.5) 55%, rgba(255,255,255,0.3) 65%, rgba(255,255,255,0.15) 72%, rgba(255,255,255,0.06) 80%, rgba(255,255,255,0.01) 90%, transparent 100%)`,
-                          WebkitMaskImage: `radial-gradient(${Math.round(dripState.width * 2.5)}px ${Math.round(dripState.height * 0.35)}px, white 0%, white 15%, rgba(255,255,255,0.9) 30%, rgba(255,255,255,0.7) 45%, rgba(255,255,255,0.5) 55%, rgba(255,255,255,0.3) 65%, rgba(255,255,255,0.15) 72%, rgba(255,255,255,0.06) 80%, rgba(255,255,255,0.01) 90%, transparent 100%)`,
+                          animation: `${dripId}-sweep-${idx} 9s linear 5s infinite backwards`,
+                          maskImage: `radial-gradient(${Math.round(drip.garmentWidth * 2.5)}px ${Math.round(drip.garmentHeight * 0.35)}px, white 0%, white 15%, rgba(255,255,255,0.9) 30%, rgba(255,255,255,0.7) 45%, rgba(255,255,255,0.5) 55%, rgba(255,255,255,0.3) 65%, rgba(255,255,255,0.15) 72%, rgba(255,255,255,0.06) 80%, rgba(255,255,255,0.01) 90%, transparent 100%)`,
+                          WebkitMaskImage: `radial-gradient(${Math.round(drip.garmentWidth * 2.5)}px ${Math.round(drip.garmentHeight * 0.35)}px, white 0%, white 15%, rgba(255,255,255,0.9) 30%, rgba(255,255,255,0.7) 45%, rgba(255,255,255,0.5) 55%, rgba(255,255,255,0.3) 65%, rgba(255,255,255,0.15) 72%, rgba(255,255,255,0.06) 80%, rgba(255,255,255,0.01) 90%, transparent 100%)`,
                           maskRepeat: "no-repeat",
                           WebkitMaskRepeat: "no-repeat",
                           maskSize: "100% 100%",
@@ -879,7 +1082,7 @@ function Home() {
                       </div>
                     </div>
                   </div>
-                )}
+                ))}
                 <canvas ref={overlayARef} className="absolute inset-0 w-full h-full pointer-events-none transition-opacity duration-300 ease-out" style={{ zIndex: 11 }} />
                 <canvas ref={overlayBRef} className="absolute inset-0 w-full h-full pointer-events-none transition-opacity duration-300 ease-out" style={{ zIndex: 11 }} />
                 {/* Focus box overlay */}

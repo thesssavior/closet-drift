@@ -1,10 +1,10 @@
 fastapi
 python-multipart
 uvicorn[standard]
-optimum[onnxruntime]
 transformers
+torch
+torchvision
 numpy
-scipy
 Pillow
 requests
 python-dotenv
