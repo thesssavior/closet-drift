@@ -1036,14 +1036,14 @@ function Home() {
                     className="absolute inset-0 pointer-events-none"
                     style={{
                       zIndex: focusDimmed ? 11 : 1,
-                      opacity: dripVisible && !(focusDimmed && drip.segId === focusCategory) ? 1 : 0,
+                      opacity: dripVisible && !(focusDimmed && drip.segId === focusCategory) ? (focusDimmed ? 0.39 : 1) : 0,
                       transition: "opacity 1.5s ease",
                     }}
                   >
                     <style>{`
                       @keyframes ${dripId}-sweep-${idx} {
                         0%   { -webkit-mask-position: 0 ${Math.round(drip.garmentY - drip.garmentHeight * 0.35 - drip.height / 2)}px; mask-position: 0 ${Math.round(drip.garmentY - drip.garmentHeight * 0.35 - drip.height / 2)}px; opacity: 0; }
-                        3%   { opacity: 0.7; }
+                        3%   { opacity: 0.57; }
                         33%  { -webkit-mask-position: 0 ${Math.round(drip.garmentY + drip.garmentHeight * 1.35 - drip.height / 2)}px; mask-position: 0 ${Math.round(drip.garmentY + drip.garmentHeight * 1.35 - drip.height / 2)}px; opacity: 0.7; }
                         34%  { -webkit-mask-position: 0 ${Math.round(drip.garmentY + drip.garmentHeight * 1.35 - drip.height / 2)}px; mask-position: 0 ${Math.round(drip.garmentY + drip.garmentHeight * 1.35 - drip.height / 2)}px; opacity: 0; }
                         100% { -webkit-mask-position: 0 ${Math.round(drip.garmentY - drip.garmentHeight * 0.35 - drip.height / 2)}px; mask-position: 0 ${Math.round(drip.garmentY - drip.garmentHeight * 0.35 - drip.height / 2)}px; opacity: 0; }
