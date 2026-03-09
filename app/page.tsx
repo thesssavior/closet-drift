@@ -103,7 +103,7 @@ function Home() {
   const dripMaskUrlRef = useRef<string | null>(null);
   const fullMaskB64Ref = useRef<string | null>(null);
   const focusMaskUrlRef = useRef<string | null>(null);
-  const [dripState, setDripState] = useState<{ segId: number; maskUrl: string; width: number; height: number; garmentWidth: number; garmentHeight: number }[] | null>(null);
+  const [dripState, setDripState] = useState<{ segId: number; maskUrl: string; width: number; height: number; garmentWidth: number; garmentHeight: number; garmentY: number }[] | null>(null);
   const [focusCategory, setFocusCategory] = useState(-1);
   const [dripVisible, setDripVisible] = useState(false);
   const [focusMaskUrl, setFocusMaskUrl] = useState<string | null>(null);
@@ -565,7 +565,7 @@ function Home() {
       for (const u of dripMaskUrlRef.current.split(",")) URL.revokeObjectURL(u);
     }
 
-    const entries: { segId: number; maskUrl: string; width: number; height: number; garmentWidth: number; garmentHeight: number }[] = [];
+    const entries: { segId: number; maskUrl: string; width: number; height: number; garmentWidth: number; garmentHeight: number; garmentY: number }[] = [];
     const urls: string[] = [];
     let remaining = filteredMasks.size;
 
@@ -586,11 +586,11 @@ function Home() {
         for (let i = 0; i < d.data.length; i += 4) {
           const v = d.data[i] / 255;
           // Steeper falloff (v^3) + threshold cutoff to prevent halo bleed
-          const a = v * v * v;
+          const a = v * v;
           d.data[i] = 255;
           d.data[i + 1] = 255;
           d.data[i + 2] = 255;
-          d.data[i + 3] = a < 0.05 ? 0 : Math.round(a * 255);
+          d.data[i + 3] = a < 0.03 ? 0 : Math.round(a * 255);
         }
         ctx.putImageData(d, 0, 0);
 
@@ -605,6 +605,7 @@ function Home() {
             height: h,
             garmentWidth: bbox ? bbox.w : w,
             garmentHeight: bbox ? bbox.h : h,
+            garmentY: bbox ? bbox.y : 0,
           });
           remaining--;
           if (remaining === 0) {
@@ -1041,11 +1042,11 @@ function Home() {
                   >
                     <style>{`
                       @keyframes ${dripId}-sweep-${idx} {
-                        0%   { -webkit-mask-position: 0 ${Math.round(-drip.height * 0.675)}px; mask-position: 0 ${Math.round(-drip.height * 0.675)}px; opacity: 0; }
-                        3%   { opacity: 0.5; }
-                        33%  { -webkit-mask-position: 0 ${Math.round(drip.height * 0.675)}px; mask-position: 0 ${Math.round(drip.height * 0.675)}px; opacity: 0.5; }
-                        34%  { -webkit-mask-position: 0 ${Math.round(drip.height * 0.675)}px; mask-position: 0 ${Math.round(drip.height * 0.675)}px; opacity: 0; }
-                        100% { -webkit-mask-position: 0 ${Math.round(-drip.height * 0.675)}px; mask-position: 0 ${Math.round(-drip.height * 0.675)}px; opacity: 0; }
+                        0%   { -webkit-mask-position: 0 ${Math.round(drip.garmentY - drip.garmentHeight * 0.35 - drip.height / 2)}px; mask-position: 0 ${Math.round(drip.garmentY - drip.garmentHeight * 0.35 - drip.height / 2)}px; opacity: 0; }
+                        3%   { opacity: 0.7; }
+                        33%  { -webkit-mask-position: 0 ${Math.round(drip.garmentY + drip.garmentHeight * 1.35 - drip.height / 2)}px; mask-position: 0 ${Math.round(drip.garmentY + drip.garmentHeight * 1.35 - drip.height / 2)}px; opacity: 0.7; }
+                        34%  { -webkit-mask-position: 0 ${Math.round(drip.garmentY + drip.garmentHeight * 1.35 - drip.height / 2)}px; mask-position: 0 ${Math.round(drip.garmentY + drip.garmentHeight * 1.35 - drip.height / 2)}px; opacity: 0; }
+                        100% { -webkit-mask-position: 0 ${Math.round(drip.garmentY - drip.garmentHeight * 0.35 - drip.height / 2)}px; mask-position: 0 ${Math.round(drip.garmentY - drip.garmentHeight * 0.35 - drip.height / 2)}px; opacity: 0; }
                       }
                     `}</style>
                     <div
@@ -1062,8 +1063,8 @@ function Home() {
                         className="absolute inset-0"
                         style={{
                           animation: `${dripId}-sweep-${idx} 9s linear 5s infinite backwards`,
-                          maskImage: `radial-gradient(${Math.round(drip.garmentWidth * 2.5)}px ${Math.round(drip.garmentHeight * 0.35)}px, white 0%, white 15%, rgba(255,255,255,0.9) 30%, rgba(255,255,255,0.7) 45%, rgba(255,255,255,0.5) 55%, rgba(255,255,255,0.3) 65%, rgba(255,255,255,0.15) 72%, rgba(255,255,255,0.06) 80%, rgba(255,255,255,0.01) 90%, transparent 100%)`,
-                          WebkitMaskImage: `radial-gradient(${Math.round(drip.garmentWidth * 2.5)}px ${Math.round(drip.garmentHeight * 0.35)}px, white 0%, white 15%, rgba(255,255,255,0.9) 30%, rgba(255,255,255,0.7) 45%, rgba(255,255,255,0.5) 55%, rgba(255,255,255,0.3) 65%, rgba(255,255,255,0.15) 72%, rgba(255,255,255,0.06) 80%, rgba(255,255,255,0.01) 90%, transparent 100%)`,
+                          maskImage: `radial-gradient(${Math.round(drip.garmentWidth * 4)}px ${Math.round(drip.garmentHeight * 0.55)}px, white 0%, rgba(255,255,255,0.85) 15%, rgba(255,255,255,0.65) 30%, rgba(255,255,255,0.45) 45%, rgba(255,255,255,0.25) 60%, rgba(255,255,255,0.1) 78%, transparent 100%)`,
+                          WebkitMaskImage: `radial-gradient(${Math.round(drip.garmentWidth * 4)}px ${Math.round(drip.garmentHeight * 0.55)}px, white 0%, rgba(255,255,255,0.85) 15%, rgba(255,255,255,0.65) 30%, rgba(255,255,255,0.45) 45%, rgba(255,255,255,0.25) 60%, rgba(255,255,255,0.1) 78%, transparent 100%)`,
                           maskRepeat: "no-repeat",
                           WebkitMaskRepeat: "no-repeat",
                           maskSize: "100% 100%",
@@ -1075,7 +1076,7 @@ function Home() {
                           style={{
                             background: focusDimmed
                               ? "white"
-                              : "linear-gradient(180deg, #8070d0 0%, #a078e0 15%, #d070a0 30%, #f0a0a0 45%, #f0c878 60%, #e0e0a0 72%, #80d8b8 85%, #70c0a0 100%)",
+                              : "linear-gradient(135deg, #7060d0 0%, #9070e0 18%, #c068b0 35%, #f0a0a0 50%, #f0c878 65%, #d8e090 80%, #80d8b8 100%)",
                             transition: "background 0.3s ease",
                           }}
                         />
