@@ -177,8 +177,10 @@ def embed_query(text: str, output_dimensionality: int | None = None) -> list[flo
 
 def _point_to_product(point) -> dict:
     p = point.payload
-    crop = p.get("crop_filename", "")
-    image_url = f"/crops/{crop}" if crop else ""
+    image_url = p.get("crop_url", "")
+    if not image_url:
+        crop = p.get("crop_filename", "")
+        image_url = f"/crops/{crop}" if crop else ""
     return {
         "id": point.id,
         "name": p.get("description", ""),

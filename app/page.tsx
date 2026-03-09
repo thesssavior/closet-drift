@@ -833,7 +833,7 @@ function Home() {
                     style={{
                       zIndex: focusDimmed ? 11 : 1,
                       opacity: dripVisible ? 1 : 0,
-                      transition: "opacity 1.5s ease, z-index 0s",
+                      transition: "opacity 1.5s ease",
                     }}
                   >
                     <style>{`
@@ -867,7 +867,6 @@ function Home() {
                           WebkitMaskSize: "100% 100%",
                         } as React.CSSProperties}
                       >
-                        {/* Rainbow glow when idle, white fog when garment focused */}
                         <div
                           className="absolute inset-0"
                           style={{
