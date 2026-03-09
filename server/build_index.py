@@ -1,8 +1,10 @@
 """
 Build Qdrant vector index from Fashionpedia train dataset.
 
-Downloads images from S3, crops garments locally, embeds descriptions,
-and upserts to Qdrant with 768-dim vectors.
+Downloads images from Flickr, crops garments in memory, uploads crops
+to Supabase Storage, embeds descriptions via Gemini, and upserts to Qdrant.
+
+No large files saved locally — only the items_cache.json (~20MB) for resume.
 
 Features:
   - Parallel image downloads (8 threads)
@@ -13,9 +15,9 @@ Features:
 Usage:
   1. Download annotations:
      curl -L "https://s3.amazonaws.com/ifashionist-dataset/annotations/instances_attributes_train2020.json" -o data/fashionpedia_train.json
-  2. Set env vars in .env.local: QDRANT_URL, QDRANT_API_KEY, GEMINI_API_KEY
-  3. Run: python build_index.py
-  4. To force full rebuild: python build_index.py --fresh
+  2. Set env vars in .env.local: QDRANT_URL, QDRANT_API_KEY, GEMINI_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY
+  3. Run: python -u build_index.py
+  4. To force full rebuild: python -u build_index.py --fresh
 """
 
 import io
@@ -37,14 +39,22 @@ load_dotenv(_project_root / ".env")
 QDRANT_URL = os.environ["QDRANT_URL"]
 QDRANT_API_KEY = os.environ["QDRANT_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
 COLLECTION = "fashionpedia_v2"
 EMBED_DIM = 768
 EMBED_BATCH = 96        # texts per Gemini API call
 EMBED_WORKERS = 4       # concurrent Gemini API calls
-UPSERT_BATCH = 500      # points per Qdrant upsert (larger = fewer HTTP calls)
+UPSERT_BATCH = 500      # points per Qdrant upsert
 CHECKPOINT_EVERY = 500  # save progress every N items embedded+upserted
 GEMINI_EMBED_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents?key={GEMINI_API_KEY}"
+
+SUPABASE_BUCKET = "crops"
+SUPABASE_HEADERS = {
+    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    "apikey": SUPABASE_SERVICE_KEY,
+}
 
 WEARABLE_IDS = set(range(27))
 
@@ -61,17 +71,61 @@ FASHIONPEDIA_ATTRIBUTES = {
     34: "sweetheart neckline", 35: "straight fit", 36: "loose fit", 37: "tight fit",
 }
 
-S3_BASE = "https://s3.amazonaws.com/ifashionist-dataset/images/train2020"
-CROPS_DIR = Path(__file__).parent / "static" / "crops"
-IMG_CACHE_DIR = Path(__file__).parent / "data" / "train_images"
 CHECKPOINT_PATH = Path(__file__).parent / "data" / "checkpoint.json"
 ITEMS_CACHE_PATH = Path(__file__).parent / "data" / "items_cache.json"
+
+
+# --------------- Supabase Storage ---------------
+
+def ensure_bucket():
+    """Create the crops bucket if it doesn't exist."""
+    r = requests.get(
+        f"{SUPABASE_URL}/storage/v1/bucket/{SUPABASE_BUCKET}",
+        headers=SUPABASE_HEADERS,
+        timeout=10,
+    )
+    if r.status_code == 200:
+        print(f"Supabase bucket '{SUPABASE_BUCKET}' exists")
+        return
+
+    resp = requests.post(
+        f"{SUPABASE_URL}/storage/v1/bucket",
+        headers={**SUPABASE_HEADERS, "Content-Type": "application/json"},
+        json={"id": SUPABASE_BUCKET, "name": SUPABASE_BUCKET, "public": True},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    print(f"Created Supabase bucket '{SUPABASE_BUCKET}'")
+
+
+def upload_crop_to_supabase(filename: str, jpeg_bytes: bytes) -> str:
+    """Upload JPEG bytes to Supabase Storage. Returns public URL."""
+    resp = requests.post(
+        f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{filename}",
+        headers={
+            **SUPABASE_HEADERS,
+            "Content-Type": "image/jpeg",
+            "x-upsert": "true",
+        },
+        data=jpeg_bytes,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{filename}"
+
+
+def check_crop_exists(filename: str) -> str | None:
+    """Check if crop already exists in Supabase. Returns public URL if so."""
+    url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{filename}"
+    resp = requests.head(url, timeout=10)
+    if resp.status_code == 200:
+        return url
+    return None
 
 
 # --------------- Checkpoint ---------------
 
 def load_checkpoint() -> int:
-    """Return the number of items already embedded+upserted."""
     if CHECKPOINT_PATH.exists():
         try:
             data = json.loads(CHECKPOINT_PATH.read_text())
@@ -91,7 +145,6 @@ def save_checkpoint(items_done: int):
 # --------------- Gemini Embedding ---------------
 
 def _embed_one_batch(texts: list[str]) -> list[list[float]]:
-    """Embed a single batch (up to EMBED_BATCH texts). Retries once on failure."""
     body = {
         "requests": [
             {
@@ -114,10 +167,7 @@ def _embed_one_batch(texts: list[str]) -> list[list[float]]:
 
 
 def embed_texts_parallel(texts: list[str]) -> list[list[float]]:
-    """Embed a large list of texts using parallel API calls."""
-    # Split into sub-batches
     batches = [texts[i:i + EMBED_BATCH] for i in range(0, len(texts), EMBED_BATCH)]
-
     results: list[list[list[float]]] = [[] for _ in batches]
 
     with ThreadPoolExecutor(max_workers=EMBED_WORKERS) as pool:
@@ -131,17 +181,14 @@ def embed_texts_parallel(texts: list[str]) -> list[list[float]]:
                 results[idx] = future.result()
             except Exception as e:
                 print(f"  [embed] batch {idx} failed permanently: {e}")
-                # Return zero vectors so we don't lose alignment
                 results[idx] = [[0.0] * EMBED_DIM] * len(batches[idx])
 
-    # Flatten
     return [vec for batch_vecs in results for vec in batch_vecs]
 
 
 # --------------- Qdrant ---------------
 
 def ensure_collection():
-    """Create collection if it doesn't exist (don't delete on resume)."""
     r = requests.get(
         f"{QDRANT_URL}/collections/{COLLECTION}",
         headers={"api-key": QDRANT_API_KEY},
@@ -174,36 +221,28 @@ def upsert_batch(points: list[dict]):
     resp.raise_for_status()
 
 
-# --------------- Image Download + Crop ---------------
+# --------------- Image Download + Crop (all in memory) ---------------
 
-def download_image(filename: str) -> Image.Image | None:
-    cache_path = IMG_CACHE_DIR / filename
-    if cache_path.exists():
-        try:
-            return Image.open(cache_path)
-        except Exception:
-            cache_path.unlink(missing_ok=True)
-
-    url = f"{S3_BASE}/{filename}"
+def download_image(original_url: str) -> Image.Image | None:
+    if not original_url:
+        return None
     try:
-        resp = requests.get(url, timeout=30)
+        resp = requests.get(original_url, timeout=30)
         resp.raise_for_status()
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_bytes(resp.content)
         return Image.open(io.BytesIO(resp.content))
     except Exception:
         return None
 
 
-def crop_garment(img: Image.Image, bbox: list, ann_id: int, padding: float = 0.1) -> tuple[str, int, int] | None:
+def crop_and_upload(img: Image.Image, bbox: list, ann_id: int, padding: float = 0.1) -> tuple[str, int, int] | None:
+    """Crop garment from image, upload to Supabase, return (url, w, h)."""
     crop_filename = f"{ann_id}.jpg"
-    crop_path = CROPS_DIR / crop_filename
-    if crop_path.exists():
-        try:
-            with Image.open(crop_path) as existing:
-                return crop_filename, existing.size[0], existing.size[1]
-        except Exception:
-            pass
+
+    # Check if already uploaded
+    existing_url = check_crop_exists(crop_filename)
+    if existing_url:
+        # We don't know dimensions without downloading — crop anyway for metadata
+        pass  # Fall through to crop for dimensions, but skip upload
 
     x, y, w, h = bbox
     img_w, img_h = img.size
@@ -222,15 +261,28 @@ def crop_garment(img: Image.Image, bbox: list, ann_id: int, padding: float = 0.1
         scale = 400 / max_side
         crop = crop.resize((int(crop.size[0] * scale), int(crop.size[1] * scale)), Image.LANCZOS)
 
-    crop.save(crop_path, "JPEG", quality=85)
-    return crop_filename, crop.size[0], crop.size[1]
+    crop_w, crop_h = crop.size
+
+    if existing_url:
+        return existing_url, crop_w, crop_h
+
+    # Encode to JPEG bytes in memory
+    buf = io.BytesIO()
+    crop.save(buf, "JPEG", quality=85)
+    jpeg_bytes = buf.getvalue()
+
+    try:
+        url = upload_crop_to_supabase(crop_filename, jpeg_bytes)
+        return url, crop_w, crop_h
+    except Exception as e:
+        print(f"  [upload] {crop_filename} failed: {e}")
+        return None
 
 
-# --------------- Build Items (with disk cache) ---------------
+# --------------- Build Items ---------------
 
 def build_items(annotations_path: str) -> list[dict]:
-    """Parse annotations, download images, crop garments. Caches result to disk."""
-    # Check for cached items list (the slow part is downloading, not parsing)
+    """Parse annotations, download images, crop garments, upload to Supabase."""
     if ITEMS_CACHE_PATH.exists():
         print(f"Loading cached items from {ITEMS_CACHE_PATH}...")
         with open(ITEMS_CACHE_PATH) as f:
@@ -245,9 +297,6 @@ def build_items(annotations_path: str) -> list[dict]:
     categories = {c["id"]: c["name"] for c in data["categories"]}
     attributes = {a["id"]: a["name"] for a in data["attributes"]}
     images_map = {img["id"]: img for img in data["images"]}
-
-    CROPS_DIR.mkdir(parents=True, exist_ok=True)
-    IMG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     # Group annotations by image
     img_anns: dict[int, list[dict]] = {}
@@ -268,21 +317,22 @@ def build_items(annotations_path: str) -> list[dict]:
     for batch_start in range(0, len(image_ids), dl_batch):
         batch_ids = image_ids[batch_start : batch_start + dl_batch]
 
-        # Download concurrently
+        # Download concurrently from Flickr original URLs
         downloaded: dict[int, Image.Image] = {}
         with ThreadPoolExecutor(max_workers=8) as pool:
             futures = {}
             for img_id in batch_ids:
-                fn = images_map.get(img_id, {}).get("file_name", "")
-                if fn:
-                    futures[pool.submit(download_image, fn)] = img_id
+                img_info = images_map.get(img_id, {})
+                url = img_info.get("original_url", "")
+                if url:
+                    futures[pool.submit(download_image, url)] = img_id
             for future in as_completed(futures):
                 img_id = futures[future]
                 result = future.result()
                 if result:
                     downloaded[img_id] = result
 
-        # Crop
+        # Crop and upload
         for img_id in batch_ids:
             img = downloaded.get(img_id)
             if not img:
@@ -290,11 +340,11 @@ def build_items(annotations_path: str) -> list[dict]:
                 continue
 
             for ann in img_anns[img_id]:
-                crop_result = crop_garment(img, ann["bbox"], ann["id"])
+                crop_result = crop_and_upload(img, ann["bbox"], ann["id"])
                 if not crop_result:
                     skipped += 1
                     continue
-                crop_filename, crop_w, crop_h = crop_result
+                crop_url, crop_w, crop_h = crop_result
                 cat_id = ann["category_id"]
                 cat_name = categories.get(cat_id, "clothing")
                 attr_ids = ann.get("attribute_ids", [])
@@ -310,7 +360,7 @@ def build_items(annotations_path: str) -> list[dict]:
                     "category": cat_name,
                     "category_id": cat_id,
                     "attributes": attr_names,
-                    "crop_filename": crop_filename,
+                    "crop_url": crop_url,
                     "width": crop_w,
                     "height": crop_h,
                 })
@@ -326,8 +376,8 @@ def build_items(annotations_path: str) -> list[dict]:
 
     print(f"Built {len(items)} items ({skipped} skipped) in {(time.time()-t0)/60:.1f}m")
 
-    # Cache to disk so re-runs skip this phase
     print(f"Saving items cache to {ITEMS_CACHE_PATH}...")
+    ITEMS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(ITEMS_CACHE_PATH, "w") as f:
         json.dump(items, f)
 
@@ -350,13 +400,16 @@ def main():
         CHECKPOINT_PATH.unlink(missing_ok=True)
         ITEMS_CACHE_PATH.unlink(missing_ok=True)
 
-    # Phase 1: Build items (download + crop) — cached to disk
+    # Phase 0: Ensure Supabase bucket exists
+    ensure_bucket()
+
+    # Phase 1: Build items (download + crop + upload to Supabase)
     items = build_items(str(annotations_path))
     if not items:
         print("No items to index")
         return
 
-    # Phase 2: Ensure collection exists (don't delete on resume!)
+    # Phase 2: Ensure Qdrant collection exists
     ensure_collection()
 
     # Phase 3: Embed + upsert with checkpoint resume
@@ -374,12 +427,10 @@ def main():
     done = start_from
     t0 = time.time()
 
-    # Process in chunks of UPSERT_BATCH
     for chunk_start in range(0, len(remaining), UPSERT_BATCH):
         chunk = remaining[chunk_start : chunk_start + UPSERT_BATCH]
         texts = [item["description"] for item in chunk]
 
-        # Parallel embedding
         try:
             vectors = embed_texts_parallel(texts)
         except Exception as e:
@@ -388,7 +439,6 @@ def main():
             print(f"Checkpoint saved at {done}. Re-run to resume.")
             return
 
-        # Build points and upsert
         points = []
         for item, vector in zip(chunk, vectors):
             points.append({
@@ -399,7 +449,7 @@ def main():
                     "category": item["category"],
                     "category_id": item["category_id"],
                     "attributes": item["attributes"],
-                    "crop_filename": item["crop_filename"],
+                    "crop_url": item["crop_url"],
                     "width": item["width"],
                     "height": item["height"],
                 },
@@ -415,7 +465,6 @@ def main():
 
         done += len(chunk)
 
-        # Checkpoint
         if done % CHECKPOINT_EVERY < UPSERT_BATCH or chunk_start + UPSERT_BATCH >= len(remaining):
             save_checkpoint(done)
 
@@ -425,7 +474,6 @@ def main():
         print(f"  [{done}/{total}] embedded+upserted | {rate:.0f} items/s | ETA {eta/60:.0f}m")
 
     print(f"\nDone! {total} items indexed in '{COLLECTION}' in {(time.time()-t0)/60:.1f}m")
-    # Clean up checkpoint on success
     CHECKPOINT_PATH.unlink(missing_ok=True)
 
 

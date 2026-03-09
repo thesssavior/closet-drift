@@ -12,11 +12,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY static/ static/
 
-# Pre-download and export ONNX model at build time
-RUN python -c "from transformers import SegformerImageProcessor; \
-    from optimum.onnxruntime import ORTModelForSemanticSegmentation; \
-    SegformerImageProcessor.from_pretrained('mattmdjaga/segformer_b2_clothes'); \
-    ORTModelForSemanticSegmentation.from_pretrained('mattmdjaga/segformer_b2_clothes', export=True)"
+# Pre-download YOLOS + SAM2 models at build time
+RUN python -c "from transformers import AutoImageProcessor, AutoModelForObjectDetection, Sam2Processor, Sam2Model; \
+    AutoImageProcessor.from_pretrained('valentinafeve/yolos-fashionpedia'); \
+    AutoModelForObjectDetection.from_pretrained('valentinafeve/yolos-fashionpedia'); \
+    Sam2Processor.from_pretrained('facebook/sam2.1-hiera-tiny'); \
+    Sam2Model.from_pretrained('facebook/sam2.1-hiera-tiny')"
 
 EXPOSE 8000
 

@@ -14,14 +14,20 @@ load_dotenv(_project_root / ".env")
 
 import numpy as np
 import requests as http_requests
-from transformers import SegformerImageProcessor
-from optimum.onnxruntime import ORTModelForSemanticSegmentation
-from scipy.ndimage import zoom
+import torch
+from torchvision.ops import nms
+from transformers import (
+    AutoImageProcessor,
+    AutoModelForObjectDetection,
+    Sam2Processor,
+    Sam2Model,
+)
+
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import Image, ImageFilter
+from PIL import Image
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchAny
 
@@ -44,78 +50,200 @@ GEMINI_EMBED_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gem
 qdrant: QdrantClient | None = None
 QDRANT_COLLECTION = "fashionpedia_v2"
 
-LABELS = {
-    0: "Background",
-    1: "Hat",
-    2: "Hair",
-    3: "Sunglasses",
-    4: "Upper-clothes",
-    5: "Skirt",
-    6: "Pants",
-    7: "Dress",
-    8: "Belt",
-    9: "Left-shoe",
-    10: "Right-shoe",
-    11: "Face",
-    12: "Left-leg",
-    13: "Right-leg",
-    14: "Left-arm",
-    15: "Right-arm",
-    16: "Bag",
-    17: "Scarf",
+# YOLOS-Fashionpedia category labels (46 classes)
+YOLOS_LABELS = {
+    0: "shirt, blouse", 1: "top, t-shirt, sweatshirt", 2: "sweater", 3: "cardigan",
+    4: "jacket", 5: "vest", 6: "pants", 7: "shorts", 8: "skirt", 9: "coat",
+    10: "dress", 11: "jumpsuit", 12: "cape", 13: "glasses", 14: "hat",
+    15: "headband, head covering", 16: "tie", 17: "glove", 18: "watch", 19: "belt",
+    20: "leg warmer", 21: "tights, stockings", 22: "sock", 23: "shoe",
+    24: "bag, wallet", 25: "scarf", 26: "umbrella",
+    27: "hood", 28: "collar", 29: "lapel", 30: "epaulette", 31: "sleeve",
+    32: "pocket", 33: "neckline", 34: "buckle", 35: "zipper", 36: "applique",
+    37: "bead", 38: "bow", 39: "flower", 40: "fringe", 41: "ribbon",
+    42: "rivet", 43: "ruffle", 44: "sequin", 45: "tassel",
 }
 
-# Friendly search-friendly names
-SEARCH_NAMES = {
-    1: "hat",
-    3: "sunglasses",
-    4: "top shirt jacket",
-    5: "skirt",
-    6: "pants trousers",
-    7: "dress",
-    8: "belt",
-    9: "shoes",
-    10: "shoes",
-    16: "bag",
-    17: "scarf",
+# Only keep main, large garment categories
+YOLOS_CLOTHING_IDS = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 21, 23, 24}
+#  0 shirt/blouse, 1 top/t-shirt, 2 sweater, 3 cardigan, 4 jacket, 5 vest,
+#  6 pants, 7 shorts, 8 skirt, 9 coat, 10 dress, 11 jumpsuit,
+# 21 tights/stockings, 23 shoe, 24 bag/wallet
+
+# YOLOS category → search-friendly name
+YOLOS_SEARCH_NAMES = {
+    0: "shirt blouse", 1: "top t-shirt sweatshirt", 2: "sweater", 3: "cardigan",
+    4: "jacket", 5: "vest", 6: "pants", 7: "shorts", 8: "skirt", 9: "coat",
+    10: "dress", 11: "jumpsuit", 12: "cape", 13: "glasses sunglasses", 14: "hat",
+    15: "headband head covering", 16: "tie", 17: "glove", 18: "watch", 19: "belt",
+    20: "leg warmer", 21: "tights stockings", 22: "sock", 23: "shoe shoes",
+    24: "bag wallet", 25: "scarf", 26: "umbrella",
 }
 
-CLOTHING_IDS = {1, 3, 4, 5, 6, 7, 8, 9, 10, 16, 17}
-
-# SegFormer label IDs → Fashionpedia category IDs for filtering
-SEGFORMER_TO_FASHIONPEDIA = {
-    4: [0, 1, 2, 3, 4, 5],   # Upper-clothes → shirt/top/sweater/cardigan/jacket/vest
-    5: [8],                    # Skirt
-    6: [6, 7],                 # Pants → pants/shorts
-    7: [10, 11],               # Dress → dress/jumpsuit
-    1: [14],                   # Hat
-    3: [13],                   # Sunglasses
-    8: [19],                   # Belt
-    9: [23], 10: [23],         # Left/Right-shoe → shoe
-    16: [24],                  # Bag
-    17: [25],                  # Scarf
+# YOLOS category → Fashionpedia category IDs for Qdrant filtering
+YOLOS_TO_FASHIONPEDIA = {
+    0: [0],       # shirt/blouse
+    1: [1],       # top/t-shirt/sweatshirt
+    2: [2],       # sweater
+    3: [3],       # cardigan
+    4: [4],       # jacket
+    5: [5],       # vest
+    6: [6],       # pants
+    7: [7],       # shorts
+    8: [8],       # skirt
+    9: [9],       # coat
+    10: [10],     # dress
+    11: [11],     # jumpsuit
+    12: [12],     # cape
+    13: [13],     # glasses
+    14: [14],     # hat
+    15: [15],     # headband
+    16: [16],     # tie
+    17: [17],     # glove
+    18: [18],     # watch
+    19: [19],     # belt
+    20: [20],     # leg warmer
+    21: [21],     # tights
+    22: [22],     # sock
+    23: [23],     # shoe
+    24: [24],     # bag
+    25: [25],     # scarf
+    26: [26],     # umbrella
 }
 
-processor = None
-model = None
+# YOLOS + SAM2
+yolos_processor = None
+yolos_model = None
+sam2_processor = None
+sam2_model = None
 
-# Cache: image_hash -> { seg_map, orig_w, orig_h, image_bytes }
+# Cache: image_hash -> { instances, orig_w, orig_h, image }
+# instances = list of { category_id, category_name, mask (np.ndarray), bbox }
 seg_cache: dict[str, dict] = {}
 
+YOLOS_CONFIDENCE = 0.25  # detection threshold
 
-def get_model():
-    global processor, model
-    if processor is None:
-        print("Loading SegFormer ONNX model...")
-        processor = SegformerImageProcessor.from_pretrained(
-            "mattmdjaga/segformer_b2_clothes"
-        )
-        model = ORTModelForSemanticSegmentation.from_pretrained(
-            "mattmdjaga/segformer_b2_clothes",
-            export=True,
-        )
-        print("ONNX model loaded.")
-    return processor, model
+
+def get_yolos():
+    global yolos_processor, yolos_model
+    if yolos_processor is None:
+        print("Loading YOLOS-Fashionpedia...")
+        yolos_processor = AutoImageProcessor.from_pretrained("valentinafeve/yolos-fashionpedia")
+        yolos_model = AutoModelForObjectDetection.from_pretrained("valentinafeve/yolos-fashionpedia")
+        yolos_model.eval()
+        print("YOLOS loaded.")
+    return yolos_processor, yolos_model
+
+
+def get_sam2():
+    global sam2_processor, sam2_model
+    if sam2_processor is None:
+        print("Loading SAM2 tiny...")
+        sam2_processor = Sam2Processor.from_pretrained("facebook/sam2.1-hiera-tiny")
+        sam2_model = Sam2Model.from_pretrained("facebook/sam2.1-hiera-tiny")
+        sam2_model.eval()
+        print("SAM2 loaded.")
+    return sam2_processor, sam2_model
+
+
+def detect_and_segment(img: Image.Image) -> list[dict]:
+    """Run YOLOS detection + SAM2 segmentation. Returns list of instances."""
+    yproc, ymdl = get_yolos()
+    sproc, smdl = get_sam2()
+
+    # Step 1: YOLOS detection
+    inputs = yproc(images=img, return_tensors="pt")
+    with torch.no_grad():
+        outputs = ymdl(**inputs)
+
+    target_sizes = torch.tensor([img.size[::-1]])  # (h, w)
+    results = yproc.post_process_object_detection(outputs, threshold=YOLOS_CONFIDENCE, target_sizes=target_sizes)[0]
+
+    boxes = results["boxes"]  # (N, 4) in xyxy format
+    scores = results["scores"]
+    labels = results["labels"]
+
+    # Filter to main apparel only (skip parts like collar, sleeve, pocket)
+    keep = [i for i in range(len(labels)) if labels[i].item() in YOLOS_CLOTHING_IDS]
+    if not keep:
+        return []
+
+    boxes = boxes[keep]
+    scores = scores[keep]
+    labels = labels[keep]
+
+    # NMS: remove duplicate overlapping detections (IoU > 0.5 → keep higher score)
+    nms_keep = nms(boxes, scores, iou_threshold=0.5)
+    boxes = boxes[nms_keep]
+    scores = scores[nms_keep]
+    labels = labels[nms_keep]
+
+    detected = [(YOLOS_LABELS.get(l.item(), "?"), f"{s:.2f}") for l, s in zip(labels, scores)]
+    print(f"  [yolos] detected ({len(labels)} after NMS): {detected}")
+
+    # Step 2: SAM2 segmentation — process each box individually to avoid batch shape issues
+    instances = []
+    w, h = img.size
+    for i in range(len(labels)):
+        cat_id = labels[i].item()
+        box = boxes[i].tolist()
+        single_box = [[box]]  # [[[x1, y1, x2, y2]]]
+        sam_inputs = sproc(images=img, input_boxes=single_box, return_tensors="pt")
+        with torch.no_grad():
+            sam_outputs = smdl(**sam_inputs)
+        mask_pred = sam_outputs.pred_masks.cpu()  # (1, 1, num_masks, H, W)
+        iou_scores = sam_outputs.iou_scores.cpu()  # (1, 1, num_masks)
+        best_idx = iou_scores[0, 0].argmax().item()
+        mask_tensor = mask_pred[0, 0, best_idx]  # (H, W) logits
+        # Resize to original image size
+        mask_resized = torch.nn.functional.interpolate(
+            mask_tensor.unsqueeze(0).unsqueeze(0).float(),
+            size=(h, w),
+            mode="bilinear",
+            align_corners=False,
+        )[0, 0]
+        mask = (mask_resized > 0).numpy().astype(np.uint8)
+
+        # Clip mask to bounding box — prevents SAM2 from bleeding into face/skin
+        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        bbox_mask = np.zeros_like(mask)
+        bbox_mask[y1:y2, x1:x2] = 1
+        mask = mask * bbox_mask
+
+        mask_pixels = int(mask.sum())
+        print(f"    [{i}] {YOLOS_LABELS.get(cat_id, '?')} score={scores[i]:.2f} bbox=({x1},{y1},{x2},{y2}) mask_pixels={mask_pixels}")
+
+        instances.append({
+            "category_id": cat_id,
+            "category_name": YOLOS_LABELS.get(cat_id, "unknown"),
+            "mask": mask,
+            "bbox": {"x": int(box[0]), "y": int(box[1]), "w": int(box[2] - box[0]), "h": int(box[3] - box[1])},
+            "score": scores[i].item(),
+        })
+
+    return instances
+
+
+def build_seg_map_from_instances(instances: list[dict], w: int, h: int) -> np.ndarray:
+    """Build an instance-based seg_map. Each detected item gets a unique ID (1, 2, 3...).
+    0 = background. Sorted by score ascending so higher-confidence paints last."""
+    seg_map = np.zeros((h, w), dtype=np.uint8)
+    sorted_inst = sorted(instances, key=lambda x: x["score"])
+    print(f"  [seg_map] building {w}x{h}, {len(sorted_inst)} instances:")
+    for idx, inst in enumerate(sorted_inst):
+        instance_id = idx + 1  # 1-based, 0 = background
+        inst["instance_id"] = instance_id
+        before = int((seg_map > 0).sum())
+        seg_map[inst["mask"] > 0] = instance_id
+        after = int((seg_map > 0).sum())
+        added = after - before
+        overwritten = int(inst["mask"].sum()) - added
+        print(f"    id={instance_id} {inst['category_name']} score={inst['score']:.2f} pixels={int(inst['mask'].sum())} added={added} overwritten={overwritten}")
+    unique_ids = set(np.unique(seg_map)) - {0}
+    print(f"  [seg_map] final unique IDs: {unique_ids}")
+    return seg_map
 
 
 def image_hash(data: bytes) -> str:
@@ -177,8 +305,10 @@ def embed_query(text: str, output_dimensionality: int | None = None) -> list[flo
 
 def _point_to_product(point) -> dict:
     p = point.payload
-    crop = p.get("crop_filename", "")
-    image_url = f"/crops/{crop}" if crop else ""
+    image_url = p.get("crop_url", "")
+    if not image_url:
+        crop = p.get("crop_filename", "")
+        image_url = f"/crops/{crop}" if crop else ""
     return {
         "id": point.id,
         "name": p.get("description", ""),
@@ -224,7 +354,8 @@ def search_qdrant(
 @app.on_event("startup")
 async def startup():
     global qdrant
-    get_model()
+    get_yolos()
+    get_sam2()
 
     qdrant_url = os.environ.get("QDRANT_URL", "")
     qdrant_key = os.environ.get("QDRANT_API_KEY", "")
@@ -244,7 +375,7 @@ async def startup():
     else:
         print("WARNING: QDRANT_URL / QDRANT_API_KEY not set, search disabled")
 
-    # Load pre-computed sample segmentation maps
+    # Process sample images through YOLOS+SAM2 on startup
     _cache_dir = Path(__file__).parent / "static" / "sample_cache"
     _manifest_path = _cache_dir / "manifest.json"
     if _manifest_path.exists():
@@ -254,113 +385,95 @@ async def startup():
         for filename, meta in manifest.items():
             h = meta["hash"]
             ext = meta.get("ext", ".jpg")
-            npy_path = _cache_dir / f"{h}.npy"
             img_path = _cache_dir / f"{h}{ext}"
-            if npy_path.exists() and img_path.exists() and h not in seg_cache:
-                seg_map = np.load(npy_path)
+            if img_path.exists() and h not in seg_cache:
                 img = Image.open(img_path).convert("RGB")
+                print(f"Processing sample {filename} with YOLOS+SAM2...")
+                instances = detect_and_segment(img)
+                seg_map = build_seg_map_from_instances(instances, img.size[0], img.size[1])
                 seg_cache[h] = {
                     "seg_map": seg_map,
+                    "instances": instances,
                     "orig_w": meta["orig_w"],
                     "orig_h": meta["orig_h"],
                     "image": img,
                 }
+                detected = [(inst["category_name"], f"{inst['score']:.2f}") for inst in instances]
+                print(f"  detected: {detected}")
                 loaded += 1
-        print(f"Loaded {loaded} pre-computed sample(s)")
+        print(f"Processed {loaded} sample(s) with YOLOS+SAM2")
 
+
+
+def _build_labels_and_clothing_ids(entry: dict) -> tuple[dict, list[int]]:
+    """Build labels dict and clothing IDs list from a cache entry."""
+    labels = {"0": "Background"}
+    clothing_ids = []
+    for inst in entry.get("instances", []):
+        iid = inst["instance_id"]
+        labels[str(iid)] = inst["category_name"]
+        clothing_ids.append(iid)
+    return labels, clothing_ids
+
+
+def _encode_segmap(seg_map: np.ndarray) -> str:
+    """Encode seg_map as a grayscale PNG (pixel value = category ID)."""
+    img = Image.fromarray(seg_map, mode="L")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 @app.post("/api/encode")
 async def encode_image(file: UploadFile = File(...)):
-    proc, mdl = get_model()
     data = await file.read()
     img = Image.open(io.BytesIO(data)).convert("RGB")
     h = image_hash(data)
 
     if h not in seg_cache:
-        inputs = proc(images=img, return_tensors="np")
-        outputs = mdl(**{k: v for k, v in inputs.items()})
-
-        logits = outputs.logits  # (1, num_classes, H, W)
-        if hasattr(logits, "numpy"):
-            logits = logits.numpy()
-        logits = np.array(logits)
-        target_h, target_w = img.size[1], img.size[0]
-        _, _, lh, lw = logits.shape
-        zoom_factors = (1, 1, target_h / lh, target_w / lw)
-        upsampled = zoom(logits, zoom_factors, order=1)
-        seg_map = upsampled.argmax(axis=1)[0].astype(np.uint8)
+        print(f"[encode] {img.size[0]}x{img.size[1]} running YOLOS+SAM2...")
+        instances = detect_and_segment(img)
+        seg_map = build_seg_map_from_instances(instances, img.size[0], img.size[1])
 
         seg_cache[h] = {
             "seg_map": seg_map,
+            "instances": instances,
             "orig_w": img.size[0],
             "orig_h": img.size[1],
             "image": img,
         }
 
-        unique = np.unique(seg_map)
-        detected = [LABELS[int(u)] for u in unique if int(u) in CLOTHING_IDS]
-        print(f"[encode] {img.size[0]}x{img.size[1]} detected: {detected}")
+        detected = [(inst["category_name"], f"{inst['score']:.2f}") for inst in instances]
+        print(f"[encode] detected: {detected}")
 
     entry = seg_cache[h]
-    return {"hash": h, "width": entry["orig_w"], "height": entry["orig_h"]}
-
-
-@app.post("/api/decode")
-async def decode_mask(body: dict):
-    h = body["hash"]
-    x = float(body["x"])
-    y = float(body["y"])
-    canvas_w = int(body["canvasWidth"])
-    canvas_h = int(body["canvasHeight"])
-
-    if h not in seg_cache:
-        return JSONResponse({"error": "Image not encoded"}, 400)
-
-    entry = seg_cache[h]
-    seg_map = entry["seg_map"]
-    orig_w = entry["orig_w"]
-    orig_h = entry["orig_h"]
-
-    max_dim = max(orig_w, orig_h)
-    model_scale = 1024 / max_dim
-    orig_x = max(0, min(int(x / model_scale), orig_w - 1))
-    orig_y = max(0, min(int(y / model_scale), orig_h - 1))
-
-    category_id = int(seg_map[orig_y, orig_x])
-    category_name = LABELS.get(category_id, "Unknown")
-
-    if category_id not in CLOTHING_IDS:
-        return {"mask": None, "category": category_name, "categoryId": category_id}
-
-    # Build mask and smooth edges
-    mask = (seg_map == category_id).astype(np.uint8) * 255
-    mask_img = Image.fromarray(mask)
-    mask_img = mask_img.resize((canvas_w, canvas_h), Image.BILINEAR)
-    # Smooth edges with a slight blur
-    mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=2))
-
-    buf = io.BytesIO()
-    mask_img.save(buf, format="PNG")
-    mask_b64 = base64.b64encode(buf.getvalue()).decode()
-
-    # Bounding box
-    mask_arr = np.array(mask_img)
-    ys, xs = np.where(mask_arr > 0)
-    bbox = None
-    if len(xs) > 0:
-        bbox = {
-            "x": int(xs.min()),
-            "y": int(ys.min()),
-            "w": int(xs.max() - xs.min()),
-            "h": int(ys.max() - ys.min()),
-        }
+    seg_b64 = _encode_segmap(entry["seg_map"])
+    labels, clothing_ids = _build_labels_and_clothing_ids(entry)
 
     return {
-        "mask": mask_b64,
-        "category": category_name,
-        "categoryId": category_id,
-        "bbox": bbox,
+        "hash": h,
+        "width": entry["orig_w"],
+        "height": entry["orig_h"],
+        "segMap": seg_b64,
+        "labels": labels,
+        "clothingIds": clothing_ids,
+    }
+
+
+@app.get("/api/segmap/{hash}")
+async def get_segmap(hash: str):
+    """Return the pre-computed seg_map as a base64 grayscale PNG."""
+    if hash not in seg_cache:
+        return JSONResponse({"error": "Image not encoded"}, 400)
+    entry = seg_cache[hash]
+    seg_b64 = _encode_segmap(entry["seg_map"])
+    labels, clothing_ids = _build_labels_and_clothing_ids(entry)
+    return {
+        "segMap": seg_b64,
+        "width": entry["orig_w"],
+        "height": entry["orig_h"],
+        "labels": labels,
+        "clothingIds": clothing_ids,
     }
 
 
@@ -368,7 +481,7 @@ async def decode_mask(body: dict):
 async def search_item(body: dict):
     """Search for similar products based on clicked clothing item."""
     h = body["hash"]
-    category_id = int(body["categoryId"])
+    instance_id = int(body["categoryId"])  # seg_map pixel value (now instance ID)
     limit = int(body.get("limit", 100))
     offset = int(body.get("offset", 0))
 
@@ -379,15 +492,25 @@ async def search_item(body: dict):
     seg_map = entry["seg_map"]
     img = entry["image"]
 
-    mask = (seg_map == category_id).astype(np.uint8) * 255
+    # Find the instance by its ID
+    instance = None
+    for inst in entry.get("instances", []):
+        if inst.get("instance_id") == instance_id:
+            instance = inst
+            break
+    if not instance:
+        return JSONResponse({"error": "Instance not found"}, 400)
+
+    mask = (seg_map == instance_id).astype(np.uint8) * 255
     color = dominant_color_name(img, mask)
-    search_term = SEARCH_NAMES.get(category_id, LABELS.get(category_id, "clothing"))
+
+    actual_cat_id = instance["category_id"]
+    search_term = YOLOS_SEARCH_NAMES.get(actual_cat_id, YOLOS_LABELS.get(actual_cat_id, "clothing"))
+    fashionpedia_ids = YOLOS_TO_FASHIONPEDIA.get(actual_cat_id)
+    cat_name = YOLOS_LABELS.get(actual_cat_id, "unknown")
+
     query = f"{color} {search_term}".strip()
-
-    # Map SegFormer category to Fashionpedia categories for filtering
-    fashionpedia_ids = SEGFORMER_TO_FASHIONPEDIA.get(category_id)
-
-    print(f"[search] category={LABELS[category_id]} color={color} query=\"{query}\" filter={fashionpedia_ids}")
+    print(f"[search] category={cat_name} color={color} query=\"{query}\" filter={fashionpedia_ids}")
 
     products = search_qdrant(query, limit=limit, offset=offset, category_ids=fashionpedia_ids)
 
@@ -419,30 +542,6 @@ async def find_similar(
     except Exception as e:
         print(f"[similar] error: {e}")
         return JSONResponse({"error": str(e)}, 500)
-
-
-@app.post("/api/clothing-mask")
-async def clothing_mask(body: dict):
-    """Return combined mask of all clothing segments."""
-    h = body["hash"]
-    canvas_w = int(body["canvasWidth"])
-    canvas_h = int(body["canvasHeight"])
-
-    if h not in seg_cache:
-        return JSONResponse({"error": "Image not encoded"}, 400)
-
-    seg_map = seg_cache[h]["seg_map"]
-    combined = np.zeros_like(seg_map, dtype=np.uint8)
-    for cid in CLOTHING_IDS:
-        combined[seg_map == cid] = 255
-
-    mask_img = Image.fromarray(combined)
-    mask_img = mask_img.resize((canvas_w, canvas_h), Image.BILINEAR)
-    mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=2))
-
-    buf = io.BytesIO()
-    mask_img.save(buf, format="PNG")
-    return {"mask": base64.b64encode(buf.getvalue()).decode()}
 
 
 @app.get("/api/sample-hashes")
