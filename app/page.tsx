@@ -1194,12 +1194,10 @@ function Home() {
                       title: p.name,
                     }))}
                   columns={(containerWidth) => {
-                    if (containerWidth < 250) return 2;
-                    if (containerWidth < 400) return 3;
-                    if (containerWidth < 600) return 4;
-                    if (containerWidth < 800) return 5;
-                    return 6;
-                  }}
+                    if (containerWidth < 300) return 2;                                       
+                    if (containerWidth < 500) return 3;                                       
+                    if (containerWidth < 800) return 4;                                       
+                    return 5;                                                                                   }}
                   spacing={6}
                   onClick={({ index }) => {
                     const visible = products.filter((p) => !failedImages.has(p.image) && p.image);

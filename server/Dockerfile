@@ -12,8 +12,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY static/ static/
 
-# Pre-download YOLOS + SAM2 + CLIP models at build time
+# Pre-download DETR + YOLOS + SAM2 + CLIP models at build time
 RUN python -c "from transformers import AutoImageProcessor, AutoModelForObjectDetection, Sam2Processor, Sam2Model, CLIPModel, CLIPProcessor; \
+    AutoImageProcessor.from_pretrained('facebook/detr-resnet-50'); \
+    AutoModelForObjectDetection.from_pretrained('facebook/detr-resnet-50'); \
     AutoImageProcessor.from_pretrained('valentinafeve/yolos-fashionpedia'); \
     AutoModelForObjectDetection.from_pretrained('valentinafeve/yolos-fashionpedia'); \
     Sam2Processor.from_pretrained('facebook/sam2.1-hiera-tiny'); \

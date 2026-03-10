@@ -99,6 +99,10 @@ YOLOS_TO_FASHIONPEDIA = {
     26: [26],     # umbrella
 }
 
+# Person detector (DETR)
+detr_processor = None
+detr_model = None
+
 # YOLOS + SAM2
 yolos_processor = None
 yolos_model = None
@@ -114,6 +118,56 @@ clip_model = None
 seg_cache: dict[str, dict] = {}
 
 YOLOS_CONFIDENCE = 0.25  # detection threshold
+
+
+PERSON_CONFIDENCE = 0.7
+PERSON_PADDING = 0.05  # 5% padding around person bbox
+
+
+def get_detr():
+    global detr_processor, detr_model
+    if detr_processor is None:
+        print("Loading DETR (person detector)...")
+        detr_processor = AutoImageProcessor.from_pretrained("facebook/detr-resnet-50")
+        detr_model = AutoModelForObjectDetection.from_pretrained("facebook/detr-resnet-50")
+        detr_model.eval()
+        print("DETR loaded.")
+    return detr_processor, detr_model
+
+
+def detect_persons(img: Image.Image) -> list[dict]:
+    """Detect people in the image using DETR. Returns list of person bboxes."""
+    proc, model = get_detr()
+    inputs = proc(images=img, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model(**inputs)
+    target_sizes = torch.tensor([img.size[::-1]])
+    results = proc.post_process_object_detection(outputs, threshold=PERSON_CONFIDENCE, target_sizes=target_sizes)[0]
+
+    persons = []
+    w, h = img.size
+    for i in range(len(results["labels"])):
+        if results["labels"][i].item() != 1:  # COCO class 1 = person
+            continue
+        box = results["boxes"][i].tolist()
+        score = results["scores"][i].item()
+        # Add padding
+        bw, bh = box[2] - box[0], box[3] - box[1]
+        x1 = max(0, int(box[0] - bw * PERSON_PADDING))
+        y1 = max(0, int(box[1] - bh * PERSON_PADDING))
+        x2 = min(w, int(box[2] + bw * PERSON_PADDING))
+        y2 = min(h, int(box[3] + bh * PERSON_PADDING))
+        persons.append({"bbox": (x1, y1, x2, y2), "score": score})
+
+    # NMS on person boxes
+    if len(persons) > 1:
+        p_boxes = torch.tensor([p["bbox"] for p in persons], dtype=torch.float32)
+        p_scores = torch.tensor([p["score"] for p in persons])
+        keep = nms(p_boxes, p_scores, iou_threshold=0.5)
+        persons = [persons[i] for i in keep.tolist()]
+
+    print(f"  [detr] {len(persons)} person(s) detected")
+    return persons
 
 
 def get_yolos():
@@ -170,24 +224,22 @@ def crop_from_mask(img: Image.Image, mask: np.ndarray) -> Image.Image:
     return Image.fromarray(arr).crop((x1, y1, x2, y2))
 
 
-def detect_and_segment(img: Image.Image) -> list[dict]:
-    """Run YOLOS detection + SAM2 segmentation. Returns list of instances."""
+def _detect_garments_in_crop(img: Image.Image) -> list[dict]:
+    """Run YOLOS + SAM2 on a single image (or person crop). Returns instances with masks in crop coords."""
     yproc, ymdl = get_yolos()
     sproc, smdl = get_sam2()
 
-    # Step 1: YOLOS detection
     inputs = yproc(images=img, return_tensors="pt")
     with torch.no_grad():
         outputs = ymdl(**inputs)
 
-    target_sizes = torch.tensor([img.size[::-1]])  # (h, w)
+    target_sizes = torch.tensor([img.size[::-1]])
     results = yproc.post_process_object_detection(outputs, threshold=YOLOS_CONFIDENCE, target_sizes=target_sizes)[0]
 
-    boxes = results["boxes"]  # (N, 4) in xyxy format
+    boxes = results["boxes"]
     scores = results["scores"]
     labels = results["labels"]
 
-    # Filter to main apparel only (skip parts like collar, sleeve, pocket)
     keep = [i for i in range(len(labels)) if labels[i].item() in YOLOS_CLOTHING_IDS]
     if not keep:
         return []
@@ -196,48 +248,40 @@ def detect_and_segment(img: Image.Image) -> list[dict]:
     scores = scores[keep]
     labels = labels[keep]
 
-    # NMS: remove duplicate overlapping detections (IoU > 0.5 → keep higher score)
     nms_keep = nms(boxes, scores, iou_threshold=0.5)
     boxes = boxes[nms_keep]
     scores = scores[nms_keep]
     labels = labels[nms_keep]
 
     detected = [(YOLOS_LABELS.get(l.item(), "?"), f"{s:.2f}") for l, s in zip(labels, scores)]
-    print(f"  [yolos] detected ({len(labels)} after NMS): {detected}")
+    print(f"    [yolos] {len(labels)} after NMS: {detected}")
 
-    # Step 2: SAM2 segmentation — process each box individually to avoid batch shape issues
     instances = []
     w, h = img.size
     for i in range(len(labels)):
         cat_id = labels[i].item()
         box = boxes[i].tolist()
-        single_box = [[box]]  # [[[x1, y1, x2, y2]]]
+        single_box = [[box]]
         sam_inputs = sproc(images=img, input_boxes=single_box, return_tensors="pt")
         with torch.no_grad():
             sam_outputs = smdl(**sam_inputs)
-        mask_pred = sam_outputs.pred_masks.cpu()  # (1, 1, num_masks, H, W)
-        iou_scores = sam_outputs.iou_scores.cpu()  # (1, 1, num_masks)
+        mask_pred = sam_outputs.pred_masks.cpu()
+        iou_scores = sam_outputs.iou_scores.cpu()
         best_idx = iou_scores[0, 0].argmax().item()
-        mask_tensor = mask_pred[0, 0, best_idx]  # (H, W) logits
-        # Resize to original image size
+        mask_tensor = mask_pred[0, 0, best_idx]
         mask_resized = torch.nn.functional.interpolate(
             mask_tensor.unsqueeze(0).unsqueeze(0).float(),
-            size=(h, w),
-            mode="bilinear",
-            align_corners=False,
+            size=(h, w), mode="bilinear", align_corners=False,
         )[0, 0]
         mask = (mask_resized > 0).numpy().astype(np.uint8)
 
-        # Clip mask to bounding box — prevents SAM2 from bleeding into face/skin
+        # Clip mask to detection bbox
         x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
         bbox_mask = np.zeros_like(mask)
         bbox_mask[y1:y2, x1:x2] = 1
         mask = mask * bbox_mask
-
-        mask_pixels = int(mask.sum())
-        print(f"    [{i}] {YOLOS_LABELS.get(cat_id, '?')} score={scores[i]:.2f} bbox=({x1},{y1},{x2},{y2}) mask_pixels={mask_pixels}")
 
         instances.append({
             "category_id": cat_id,
@@ -248,6 +292,55 @@ def detect_and_segment(img: Image.Image) -> list[dict]:
         })
 
     return instances
+
+
+def detect_and_segment(img: Image.Image) -> list[dict]:
+    """Detect persons first, then run YOLOS+SAM2 per person crop.
+    Falls back to full-image detection for single-person or no-person images."""
+    w, h = img.size
+
+    persons = detect_persons(img)
+
+    if len(persons) <= 1:
+        # Single person or no person detected — run on full image
+        print("  [pipeline] single/no person → full-image detection")
+        instances = _detect_garments_in_crop(img)
+        for inst in instances:
+            print(f"    {inst['category_name']} score={inst['score']:.2f} mask={int(inst['mask'].sum())}px")
+        return instances
+
+    # Multiple people — process each person crop separately
+    print(f"  [pipeline] {len(persons)} persons → per-person detection")
+    all_instances = []
+    for pi, person in enumerate(persons):
+        px1, py1, px2, py2 = person["bbox"]
+        crop = img.crop((px1, py1, px2, py2))
+        print(f"  [person {pi}] bbox=({px1},{py1},{px2},{py2}) crop={crop.size[0]}x{crop.size[1]}")
+
+        crop_instances = _detect_garments_in_crop(crop)
+
+        # Map masks and bboxes back to original image coordinates
+        for inst in crop_instances:
+            # Expand mask to full image size
+            full_mask = np.zeros((h, w), dtype=np.uint8)
+            crop_mask = inst["mask"]
+            full_mask[py1:py2, px1:px2] = crop_mask
+            inst["mask"] = full_mask
+
+            # Also clip mask to person bbox (no bleeding into other people)
+            person_clip = np.zeros((h, w), dtype=np.uint8)
+            person_clip[py1:py2, px1:px2] = 1
+            inst["mask"] = inst["mask"] * person_clip
+
+            # Offset bbox to original coords
+            inst["bbox"]["x"] += px1
+            inst["bbox"]["y"] += py1
+
+            print(f"    {inst['category_name']} score={inst['score']:.2f} mask={int(inst['mask'].sum())}px")
+
+        all_instances.extend(crop_instances)
+
+    return all_instances
 
 
 def build_seg_map_from_instances(instances: list[dict], w: int, h: int) -> np.ndarray:
