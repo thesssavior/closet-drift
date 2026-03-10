@@ -209,6 +209,8 @@ def embed_image_crop(img: Image.Image) -> list[float]:
     inputs = proc(images=img, return_tensors="pt")
     with torch.no_grad():
         feats = model.get_image_features(**inputs)
+    if not isinstance(feats, torch.Tensor):
+        feats = feats.pooler_output if hasattr(feats, "pooler_output") else feats.last_hidden_state[:, 0]
     feats = feats / feats.norm(dim=-1, keepdim=True)
     return feats[0].cpu().numpy().tolist()
 
