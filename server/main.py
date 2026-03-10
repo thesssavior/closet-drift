@@ -13,7 +13,6 @@ load_dotenv(_project_root / ".env.local")
 load_dotenv(_project_root / ".env")
 
 import numpy as np
-import requests as http_requests
 import torch
 from torchvision.ops import nms
 from transformers import (
@@ -21,6 +20,8 @@ from transformers import (
     AutoModelForObjectDetection,
     Sam2Processor,
     Sam2Model,
+    CLIPModel,
+    CLIPProcessor,
 )
 
 from fastapi import FastAPI, UploadFile, File, Query
@@ -44,11 +45,8 @@ _static_dir = Path(__file__).parent / "static" / "crops"
 if _static_dir.exists():
     app.mount("/crops", StaticFiles(directory=str(_static_dir)), name="crops")
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_EMBED_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={GEMINI_API_KEY}"
-
 qdrant: QdrantClient | None = None
-QDRANT_COLLECTION = "fashionpedia_v2"
+QDRANT_COLLECTION = "fashionpedia_clip"
 
 # YOLOS-Fashionpedia category labels (46 classes)
 YOLOS_LABELS = {
@@ -69,16 +67,6 @@ YOLOS_CLOTHING_IDS = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 21, 23, 24}
 #  0 shirt/blouse, 1 top/t-shirt, 2 sweater, 3 cardigan, 4 jacket, 5 vest,
 #  6 pants, 7 shorts, 8 skirt, 9 coat, 10 dress, 11 jumpsuit,
 # 21 tights/stockings, 23 shoe, 24 bag/wallet
-
-# YOLOS category → search-friendly name
-YOLOS_SEARCH_NAMES = {
-    0: "shirt blouse", 1: "top t-shirt sweatshirt", 2: "sweater", 3: "cardigan",
-    4: "jacket", 5: "vest", 6: "pants", 7: "shorts", 8: "skirt", 9: "coat",
-    10: "dress", 11: "jumpsuit", 12: "cape", 13: "glasses sunglasses", 14: "hat",
-    15: "headband head covering", 16: "tie", 17: "glove", 18: "watch", 19: "belt",
-    20: "leg warmer", 21: "tights stockings", 22: "sock", 23: "shoe shoes",
-    24: "bag wallet", 25: "scarf", 26: "umbrella",
-}
 
 # YOLOS category → Fashionpedia category IDs for Qdrant filtering
 YOLOS_TO_FASHIONPEDIA = {
@@ -117,6 +105,10 @@ yolos_model = None
 sam2_processor = None
 sam2_model = None
 
+# CLIP
+clip_processor = None
+clip_model = None
+
 # Cache: image_hash -> { instances, orig_w, orig_h, image }
 # instances = list of { category_id, category_name, mask (np.ndarray), bbox }
 seg_cache: dict[str, dict] = {}
@@ -144,6 +136,38 @@ def get_sam2():
         sam2_model.eval()
         print("SAM2 loaded.")
     return sam2_processor, sam2_model
+
+
+def get_clip():
+    global clip_processor, clip_model
+    if clip_processor is None:
+        print("Loading CLIP ViT-L/14...")
+        clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+        clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
+        clip_model.eval()
+        print("CLIP loaded.")
+    return clip_processor, clip_model
+
+
+def embed_image_crop(img: Image.Image) -> list[float]:
+    """Embed a single PIL image with CLIP. Returns 768d L2-normalized vector."""
+    proc, model = get_clip()
+    inputs = proc(images=img, return_tensors="pt")
+    with torch.no_grad():
+        feats = model.get_image_features(**inputs)
+    feats = feats / feats.norm(dim=-1, keepdim=True)
+    return feats[0].cpu().numpy().tolist()
+
+
+def crop_from_mask(img: Image.Image, mask: np.ndarray) -> Image.Image:
+    """Crop garment using mask, filling non-garment pixels with neutral gray."""
+    ys, xs = np.where(mask > 0)
+    if len(ys) == 0:
+        return img
+    x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+    arr = np.array(img)
+    arr[mask == 0] = 128
+    return Image.fromarray(arr).crop((x1, y1, x2, y2))
 
 
 def detect_and_segment(img: Image.Image) -> list[dict]:
@@ -250,59 +274,6 @@ def image_hash(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
 
 
-def dominant_color_name(img: Image.Image, mask: np.ndarray) -> str:
-    """Get the dominant color name from masked region of image."""
-    arr = np.array(img)
-    pixels = arr[mask > 0]
-    if len(pixels) == 0:
-        return ""
-
-    # Subsample for speed
-    if len(pixels) > 1000:
-        idx = np.random.choice(len(pixels), 1000, replace=False)
-        pixels = pixels[idx]
-
-    avg = pixels.mean(axis=0).astype(int)
-    r, g, b = int(avg[0]), int(avg[1]), int(avg[2])
-
-    # Map to basic color names
-    hsv_img = Image.new("RGB", (1, 1), (r, g, b)).convert("HSV")
-    h, s, v = hsv_img.getpixel((0, 0))
-
-    if v < 40:
-        return "black"
-    if s < 25 and v > 200:
-        return "white"
-    if s < 30:
-        return "gray"
-
-    # Hue-based (0-255 scale in PIL)
-    hue = h * 2  # convert to 0-360
-    if hue < 15 or hue >= 345:
-        return "red"
-    if hue < 40:
-        return "orange"
-    if hue < 70:
-        return "yellow"
-    if hue < 160:
-        return "green"
-    if hue < 250:
-        return "blue"
-    if hue < 300:
-        return "purple"
-    return "pink"
-
-
-def embed_query(text: str, output_dimensionality: int | None = None) -> list[float]:
-    """Embed a single query using Gemini."""
-    body: dict = {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": text}]}}
-    if output_dimensionality:
-        body["outputDimensionality"] = output_dimensionality
-    resp = http_requests.post(GEMINI_EMBED_URL, json=body, timeout=10)
-    resp.raise_for_status()
-    return resp.json()["embedding"]["values"]
-
-
 def _point_to_product(point) -> dict:
     p = point.payload
     image_url = p.get("crop_url", "")
@@ -322,17 +293,16 @@ def _point_to_product(point) -> dict:
 
 
 def search_qdrant(
-    query: str,
+    vector: list[float],
     limit: int = 100,
     offset: int = 0,
     category_ids: list[int] | None = None,
 ) -> list[dict]:
-    """Vector search on Qdrant using Gemini embeddings."""
-    if not qdrant or not GEMINI_API_KEY:
+    """Vector search on Qdrant using CLIP image embeddings."""
+    if not qdrant:
         return []
 
     try:
-        vector = embed_query(query, output_dimensionality=768)
         query_filter = None
         if category_ids:
             query_filter = Filter(
@@ -356,9 +326,10 @@ async def startup():
     global qdrant
     get_yolos()
     get_sam2()
+    get_clip()
 
-    qdrant_url = os.environ.get("QDRANT_URL", "")
-    qdrant_key = os.environ.get("QDRANT_API_KEY", "")
+    qdrant_url = os.environ.get("QDRANT_CLIP_URL", os.environ.get("QDRANT_URL", ""))
+    qdrant_key = os.environ.get("QDRANT_CLIP_API_KEY", os.environ.get("QDRANT_API_KEY", ""))
     if qdrant_url and qdrant_key:
         qdrant = QdrantClient(url=qdrant_url, api_key=qdrant_key)
         print(f"Connected to Qdrant at {qdrant_url}")
@@ -501,21 +472,20 @@ async def search_item(body: dict):
     if not instance:
         return JSONResponse({"error": "Instance not found"}, 400)
 
-    mask = (seg_map == instance_id).astype(np.uint8) * 255
-    color = dominant_color_name(img, mask)
-
     actual_cat_id = instance["category_id"]
-    search_term = YOLOS_SEARCH_NAMES.get(actual_cat_id, YOLOS_LABELS.get(actual_cat_id, "clothing"))
-    fashionpedia_ids = YOLOS_TO_FASHIONPEDIA.get(actual_cat_id)
     cat_name = YOLOS_LABELS.get(actual_cat_id, "unknown")
+    fashionpedia_ids = YOLOS_TO_FASHIONPEDIA.get(actual_cat_id)
 
-    query = f"{color} {search_term}".strip()
-    print(f"[search] category={cat_name} color={color} query=\"{query}\" filter={fashionpedia_ids}")
+    # Crop the garment region and embed with CLIP
+    mask = (seg_map == instance_id).astype(np.uint8)
+    garment_crop = crop_from_mask(img, mask)
+    print(f"[search] category={cat_name} crop={garment_crop.size} filter={fashionpedia_ids}")
+    vector = embed_image_crop(garment_crop)
 
-    products = search_qdrant(query, limit=limit, offset=offset, category_ids=fashionpedia_ids)
+    products = search_qdrant(vector, limit=limit, offset=offset, category_ids=fashionpedia_ids)
 
     return {
-        "query": query,
+        "query": cat_name,
         "products": products,
     }
 
@@ -558,4 +528,4 @@ async def sample_hashes():
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "searchEnabled": qdrant is not None and bool(GEMINI_API_KEY)}
+    return {"status": "ok", "searchEnabled": qdrant is not None}

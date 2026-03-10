@@ -12,12 +12,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY static/ static/
 
-# Pre-download YOLOS + SAM2 models at build time
-RUN python -c "from transformers import AutoImageProcessor, AutoModelForObjectDetection, Sam2Processor, Sam2Model; \
+# Pre-download YOLOS + SAM2 + CLIP models at build time
+RUN python -c "from transformers import AutoImageProcessor, AutoModelForObjectDetection, Sam2Processor, Sam2Model, CLIPModel, CLIPProcessor; \
     AutoImageProcessor.from_pretrained('valentinafeve/yolos-fashionpedia'); \
     AutoModelForObjectDetection.from_pretrained('valentinafeve/yolos-fashionpedia'); \
     Sam2Processor.from_pretrained('facebook/sam2.1-hiera-tiny'); \
-    Sam2Model.from_pretrained('facebook/sam2.1-hiera-tiny')"
+    Sam2Model.from_pretrained('facebook/sam2.1-hiera-tiny'); \
+    CLIPProcessor.from_pretrained('openai/clip-vit-large-patch14'); \
+    CLIPModel.from_pretrained('openai/clip-vit-large-patch14')"
 
 EXPOSE 8000
 
